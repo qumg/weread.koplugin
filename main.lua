@@ -1,4 +1,3 @@
-local Event = require("ui/event")
 local logger = require("weread.lib.logger")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -26,7 +25,7 @@ local _ = PluginUtil.tr
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
-    version = "1.4.2",
+    version = "1.4.3",
 }
 
 -- Stable entry point used by third-party launchers such as SimpleUI and ZenUI.
@@ -174,16 +173,23 @@ function WeReadPlugin:init()
             return self.read_report:upload_position(
                 book_id, position, elapsed_seconds)
         end,
-        goto_fraction = function(fraction)
-            local percent = math.floor(
-                math.max(0, math.min(1, tonumber(fraction) or 0))
-                    * 100 + 0.5)
+        goto_fraction = function(_fraction)
+            return false, "goto_percent_disabled"
+        end,
+        goto_xpointer = function(xpointer)
+            if not xpointer or xpointer == "" then
+                return false, "xpointer_missing"
+            end
             return pcall(function()
                 if self.ui and self.ui.rolling
-                    and self.ui.rolling.onGotoPercent then
-                    self.ui.rolling:onGotoPercent(percent)
-                elseif self.ui then
-                    self.ui:handleEvent(Event:new("GotoPercent", percent))
+                    and self.ui.rolling.gotoXPointer then
+                    self.ui.rolling:gotoXPointer(xpointer)
+                elseif self.ui and self.ui.rolling
+                    and self.ui.rolling.onGotoXPointer then
+                    self.ui.rolling:onGotoXPointer(xpointer)
+                elseif self.ui and self.ui.document
+                    and self.ui.document.gotoXPointer then
+                    self.ui.document:gotoXPointer(xpointer)
                 else
                     error("reader unavailable")
                 end

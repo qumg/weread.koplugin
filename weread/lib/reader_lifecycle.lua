@@ -69,6 +69,20 @@ function M:onWeReadSyncProgress()
     return true
 end
 
+function M:onWeReadUploadProgress()
+    local book_id = self:detectWeReadBook()
+    if not book_id or WeRead.is_mp_book(book_id) then
+        self:showTransientInfo(
+            _("This action requires an open WeRead book."), 1)
+        return false
+    end
+    if not self:requireLogin(true, false) then
+        return false
+    end
+    self.progress_sync:upload_now()
+    return true
+end
+
 function M:handleEndOfBook(status_self)
     local action = G_reader_settings and G_reader_settings:readSetting("end_document_action") or "pop-up"
     local book_id = self:detectWeReadBook()

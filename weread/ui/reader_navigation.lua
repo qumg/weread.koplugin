@@ -73,6 +73,7 @@ function M:showEndOfBookDialog(book_id)
         enable_next_chapter = next_chapter ~= nil,
         enable_book_details = book ~= nil,
         enable_sync_progress = is_regular_weread_book,
+        enable_upload_progress = is_regular_weread_book,
         annotations_visible = annotations_visible,
     }, {
         on_bookshelf = function()
@@ -106,6 +107,13 @@ function M:showEndOfBookDialog(book_id)
         end,
         on_read_stats = function()
             self:showReadStats()
+        end,
+        on_upload_progress = function()
+            if is_regular_weread_book then
+                self:onWeReadUploadProgress()
+            else
+                show_context_required()
+            end
         end,
         on_sync_progress = function()
             if is_regular_weread_book then

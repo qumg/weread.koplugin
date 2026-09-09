@@ -1,4 +1,5 @@
 local PositionMapper = require("weread.lib.position_mapper")
+local ProgressLocator = require("weread.lib.progress_locator")
 
 local logger = require("weread.lib.logger").scoped("ProgressSync")
 
@@ -11,7 +12,7 @@ local PULL_RETRY_DELAY_SECONDS = 15
 local PULL_MAX_RETRIES = 3
 local BUSY_RETRY_SECONDS = 2
 local BUSY_RETRY_LIMIT = 10
-local SAME_THRESHOLD_PERCENT = 2
+local SAME_THRESHOLD_OFFSET = 80
 local SOURCE_CONFLICT_THRESHOLD_PERCENT = 2
 
 local function log(level, ...)
@@ -66,6 +67,7 @@ function ProgressSync:new(options)
         run_online = options.run_online,
         upload_position = options.upload_position,
         goto_fraction = options.goto_fraction,
+        goto_xpointer = options.goto_xpointer,
         open_chapter = options.open_chapter,
         is_online = options.is_online or function() return true end,
         on_choice = options.on_choice or function(context)
@@ -179,18 +181,38 @@ function ProgressSync:capture_local()
             path = path,
         }
     end
-    local fraction = self:_local_fraction()
-    if fraction == nil then return nil, "position_unavailable" end
-    local position, reason = PositionMapper.local_to_remote(
+    local function get_chapter_source(uid)
+        return ProgressLocator.load_chapter_source(self.settings, book, uid)
+    end
+    local located = ProgressLocator.extract_from_document(
+        document,
+        book,
         chapters,
-        fraction,
         {
+            current_chapter = current_chapter,
             is_full_book = is_full_book == true,
-            current_chapter_uid = current_chapter
-                and (current_chapter.chapterUid or current_chapter.chapterId),
-            summary = book.summary or book.title or "",
+            get_chapter_source = get_chapter_source,
         }
     )
+    local position
+    local reason
+    if located then
+        located.is_full_book = is_full_book == true
+        position, reason = PositionMapper.from_located(chapters, located)
+    else
+        local fraction = self:_local_fraction()
+        if fraction == nil then return nil, "position_unavailable" end
+        position, reason = PositionMapper.local_to_remote(
+            chapters,
+            fraction,
+            {
+                is_full_book = is_full_book == true,
+                current_chapter_uid = current_chapter
+                    and (current_chapter.chapterUid or current_chapter.chapterId),
+                summary = "",
+            }
+        )
+    end
     if not position then return nil, reason end
     position.book_id = book_id
     position.captured_at = self.now()
@@ -276,6 +298,30 @@ function ProgressSync:_fetch_remote(book_id, chapters)
     return selected
 end
 
+function ProgressSync:_jump_to_remote(remote, context, target)
+    local document = self.get_document()
+    local chapter = target and target.chapter or (context and context.current_chapter)
+    local ok, err = ProgressLocator.goto_remote(document, remote, {
+        goto_xpointer = self.goto_xpointer,
+        get_chapter_source = function(uid)
+            return ProgressLocator.load_chapter_source(
+                self.settings, context and context.book, uid)
+        end,
+        chapter_start_xpointer = ProgressLocator.chapter_start_xpointer(
+            document, context and context.book, chapter, {
+                is_full_book = context and context.is_full_book == true,
+                chapters = context and context.chapters,
+            }),
+    })
+    if ok then return true end
+    if type(self.goto_fraction) == "function" and target and target.fraction then
+        local fallback_ok, fallback_err = self.goto_fraction(target.fraction)
+        if fallback_ok then return true end
+        return false, err or fallback_err or "jump_failed"
+    end
+    return false, err or "jump_failed"
+end
+
 function ProgressSync:_apply_remote(remote, context, options)
     options = options or {}
     local target, reason = PositionMapper.remote_to_local(
@@ -312,7 +358,7 @@ function ProgressSync:_apply_remote(remote, context, options)
         end
         return true
     end
-    local ok, err = self.goto_fraction(target.fraction)
+    local ok, err = self:_jump_to_remote(remote, context, target)
     if not ok then return false, err or "jump_failed" end
     self.dirty = false
     self:_mark_verified(
@@ -372,6 +418,10 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
         if ok and accepted then
             self.state = "verified"
             self.dirty = false
+            if reason == "manual_upload" then
+                self:_mark_verified(
+                    book_id, "manual_upload", position, position)
+            end
             self.last_uploaded_position = copy(position)
             self:_persist(book_id, {
                 last_local_position = position,
@@ -434,7 +484,7 @@ function ProgressSync:_resolve(local_position, remote, context, options)
     local comparison = PositionMapper.compare(
         local_position,
         remote,
-        SAME_THRESHOLD_PERCENT
+        SAME_THRESHOLD_OFFSET
     )
 
     if comparison == "same" and not remote.conflict then
@@ -641,7 +691,11 @@ function ProgressSync:_apply_pending_jump(book_id)
         return false
     end
     self.pending_jump = nil
-    local ok, err = self.goto_fraction(pending.fraction)
+    local target = {
+        fraction = pending.fraction,
+        chapter = context.current_chapter,
+    }
+    local ok, err = self:_jump_to_remote(pending.remote, context, target)
     if not ok then
         self.state = "error"
         self.notify("jump_failed", { error = err })
@@ -770,6 +824,25 @@ end
 
 function ProgressSync:sync_now()
     return self:_pull({ manual = true })
+end
+
+function ProgressSync:upload_now()
+    local position, reason = self:capture_local()
+    if not position then
+        self.notify("local_unavailable", { error = reason })
+        return false
+    end
+    if not self.settings:is_api_configured()
+        and not self.settings:is_cookie_configured() then
+        self.notify("authentication_required", {})
+        return false
+    end
+    if not self.is_online() then
+        self.state = "offline"
+        self.notify("offline", {})
+        return false
+    end
+    return self:_upload_snapshot(position, "manual_upload", true)
 end
 
 function ProgressSync:position_for_report(book_id)

@@ -24,6 +24,7 @@ local callbacks = {
     on_search = function() end,
     on_book_details = function() end,
     on_read_stats = function() end,
+    on_upload_progress = function() end,
     on_sync_progress = function() end,
     on_toggle_annotations = function() end,
     on_close_book = function() end,
@@ -34,6 +35,7 @@ Dialog.show({
     enable_chapter_list = true,
     enable_next_chapter = false,
     enable_book_details = false,
+    enable_upload_progress = true,
     enable_sync_progress = true,
     annotations_visible = true,
 }, callbacks)
@@ -49,13 +51,17 @@ end
 
 expect(shown and shown.title == "WeRead · Quick menu",
     "quick menu keeps the requested title")
-local sync_row = shown and shown.buttons[#shown.buttons - 1]
-expect(sync_row and #sync_row == 2,
-    "sync and annotation visibility share the penultimate row")
-expect(sync_row and sync_row[1].text == "Sync progress now",
-    "the row starts with immediate progress sync")
-expect(sync_row and sync_row[2].text == "Hide underlines and thoughts",
-    "the row shows the current annotation toggle action")
+local progress_row = shown and shown.buttons[#shown.buttons - 2]
+local annotation_row = shown and shown.buttons[#shown.buttons - 1]
+expect(progress_row and #progress_row == 2,
+    "upload and immediate sync share a progress row")
+expect(progress_row and progress_row[1].text == "WeRead: Upload progress",
+    "the progress row starts with write-only upload")
+expect(progress_row and progress_row[2].text == "Sync progress now",
+    "the progress row keeps pull-then-choose sync")
+expect(annotation_row and annotation_row[1].text
+        == "Hide underlines and thoughts",
+    "annotation visibility stays on its own row")
 expect(shown.buttons[1][1].text == "Chapter list"
         and shown.buttons[1][2].text == "Next chapter",
     "chapter actions stay visible in the global quick menu")
@@ -63,20 +69,25 @@ expect(shown.buttons[1][1].enabled == true
         and shown.buttons[1][2].enabled == false,
     "chapter actions reflect their individual availability")
 expect(shown.buttons[2][1].enabled == false
-        and sync_row[1].enabled == true,
-    "book details and progress sync reflect their availability")
+        and progress_row[1].enabled == true
+        and progress_row[2].enabled == true,
+    "book details and progress actions reflect their availability")
 
 Dialog.show({
     enable_book_details = false,
+    enable_upload_progress = false,
     enable_sync_progress = false,
     annotations_visible = false,
 }, callbacks)
-sync_row = shown and shown.buttons[#shown.buttons - 1]
-expect(#shown.buttons == 4,
-    "shared action row remains visible without WeRead book context")
-expect(sync_row and sync_row[1].enabled == false,
-    "progress sync is disabled without WeRead book context")
-expect(sync_row and sync_row[2].text == "Show underlines and thoughts",
+progress_row = shown and shown.buttons[#shown.buttons - 2]
+annotation_row = shown and shown.buttons[#shown.buttons - 1]
+expect(#shown.buttons == 5,
+    "progress and annotation rows remain visible without WeRead book context")
+expect(progress_row and progress_row[1].enabled == false
+        and progress_row[2].enabled == false,
+    "upload and sync are disabled without WeRead book context")
+expect(annotation_row and annotation_row[1].text
+        == "Show underlines and thoughts",
     "hidden annotations expose the show action")
 
 print(string.format(

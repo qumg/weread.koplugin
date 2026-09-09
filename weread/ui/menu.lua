@@ -52,6 +52,12 @@ function M:onDispatcherRegisterActions()
         title = _("WeRead · Toggle underlines and thoughts"),
         reader = true,
     })
+    Dispatcher:registerAction("weread_upload_progress", {
+        category = "none",
+        event = "WeReadUploadProgress",
+        title = _("WeRead: Upload progress"),
+        reader = true,
+    })
 end
 
 function M:addToMainMenu(menu_items)
@@ -135,6 +141,13 @@ function M:getMainMenuItems()
         local reader_items = {}
         if book_id ~= nil then
             if not WeRead.is_mp_book(book_id) then
+                reader_items[#reader_items + 1] = {
+                    text = _("WeRead: Upload progress"),
+                    keep_menu_open = true,
+                    callback = self:safeCallback(_("WeRead: Upload progress"), function()
+                        self:onWeReadUploadProgress()
+                    end),
+                }
                 reader_items[#reader_items + 1] = {
                     text = _("Sync progress now"),
                     keep_menu_open = true,
@@ -727,7 +740,7 @@ end
 
 function M:showAbout()
     UIManager:show(InfoMessage:new{
-        text = T(_("WeRead Plugin v%1\n\nDisclaimer: This project is for personal learning and technical research only, not for commercial use. All consequences arising from the use of this project (including but not limited to account bans, data loss, etc.) are borne by the user. The project author assumes no responsibility. Please comply with WeRead's user agreement and applicable laws and regulations.\n\nhttps://github.com/finlater/weread.koplugin"), self.version),
+        text = T(_("WeRead Plugin v%1\n\nDisclaimer: This project is for personal learning and technical research only, not for commercial use. All consequences arising from the use of this project (including but not limited to account bans, data loss, etc.) are borne by the user. The project author assumes no responsibility. Please comply with WeRead's user agreement and applicable laws and regulations.\n\nhttps://github.com/qumg/weread.koplugin"), self.version),
     })
 end
 

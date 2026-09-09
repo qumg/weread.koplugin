@@ -120,17 +120,63 @@ test("remote source conflict chooses newest but flags conflict", function()
     eq(selected.conflict, true, "conflict flagged")
 end)
 
-test("compare uses percentage point threshold", function()
-    local state = Mapper.compare({ percent = 25 }, { percent = 28 }, 2)
+test("compare uses chapter, summary and offset", function()
+    local state = Mapper.compare(
+        { chapter_uid = 22, chapter_offset = 150 },
+        { chapter_uid = 22, chapter_offset = 400 },
+        80
+    )
     eq(state, "remote_ahead", "remote ahead")
-    state = Mapper.compare({ percent = 25 }, { percent = 24 }, 2)
-    eq(state, "same", "within threshold")
     state = Mapper.compare(
-        { percent = 25, chapter_uid = 11 },
-        { percent = 25, chapter_uid = 22 },
-        2
+        { chapter_uid = 22, chapter_offset = 150 },
+        { chapter_uid = 22, chapter_offset = 169 },
+        80
+    )
+    eq(state, "same", "nearby offset is same")
+    state = Mapper.compare(
+        { chapter_uid = 11, chapter_offset = 10 },
+        { chapter_uid = 22, chapter_offset = 10 },
+        80
     )
     eq(state, "different", "chapter mismatch is not same")
+    state = Mapper.compare(
+        {
+            chapter_uid = 22,
+            chapter_offset = 10,
+            summary = "贝克兰德，皇后区。",
+        },
+        {
+            chapter_uid = 22,
+            chapter_offset = 500,
+            summary = "贝克兰德，皇后区。",
+        },
+        80
+    )
+    eq(state, "same", "matching summary is same")
+end)
+
+test("located chapter position does not clamp HTML offset to wordCount", function()
+    local position = assert(Mapper.from_located(chapters, {
+        chapter_uid = 22,
+        chapter_offset = 644,
+        summary = "贝克兰德，皇后区。",
+    }))
+    eq(position.chapter_uid, 22, "chapter uid")
+    eq(position.chapter_offset, 644, "html offset preserved")
+    eq(position.percent <= 100 and position.percent >= 70, true,
+        "percent is display-only and follows catalog words")
+end)
+
+test("remote HTML offset is not clamped to catalog wordCount", function()
+    local normalized = assert(Mapper.normalize_remote({
+        progress = 8,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 644,
+        summary = "贝克兰德，皇后区。",
+    }, "book", "web", chapters))
+    eq(normalized.chapter_offset, 644, "offset preserved")
+    eq(normalized.position_basis, "chapter_offset", "basis")
 end)
 
 test("missing remote offset falls back to raw percent", function()

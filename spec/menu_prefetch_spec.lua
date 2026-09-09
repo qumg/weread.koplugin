@@ -133,6 +133,14 @@ expect(toggle_action and toggle_action.reader == true
 expect(toggle_action
         and toggle_action.title == "WeRead · Toggle underlines and thoughts",
     "annotation visibility action has a gesture-friendly title")
+local upload_action = registered.weread_upload_progress
+expect(upload_action and upload_action.event == "WeReadUploadProgress",
+    "upload progress action dispatches the matching reader event")
+expect(upload_action and upload_action.reader == true
+        and upload_action.general ~= true,
+    "upload progress action is reader-only")
+expect(upload_action and upload_action.title == "WeRead: Upload progress",
+    "upload progress action uses the requested title")
 expect(registered.weread_current_page_thoughts == nil,
     "current-page thoughts is no longer exposed as a separate shortcut action")
 local bookshelf_action = registered.weread_bookshelf
@@ -259,6 +267,7 @@ host.ui.document = { file = "/books/local.epub" }
 host.detectWeReadBook = function() return nil end
 local local_reader_items = host:getMainMenuItems()
 expect(not menu_has(local_reader_items, "Sync progress now")
+        and not menu_has(local_reader_items, "WeRead: Upload progress")
         and not menu_has(local_reader_items, "Book details")
         and menu_has(local_reader_items, "Underlines and thoughts management"),
     "local document menu retained WeRead-only book actions")
@@ -266,6 +275,7 @@ expect(not menu_has(local_reader_items, "Sync progress now")
 host.detectWeReadBook = function() return "book-1" end
 local weread_reader_items = host:getMainMenuItems()
 expect(menu_has(weread_reader_items, "Sync progress now")
+        and menu_has(weread_reader_items, "WeRead: Upload progress")
         and menu_has(weread_reader_items, "Book details")
         and menu_has(weread_reader_items, "Underlines and thoughts management"),
     "WeRead book menu retained the local-book annotation submenu")
@@ -288,6 +298,7 @@ expect(cache.show_annotations == false and annotation_menu_updates == 1
 host.detectWeReadBook = function() return "mp-book" end
 local mp_reader_items = host:getMainMenuItems()
 expect(not menu_has(mp_reader_items, "Sync progress now")
+        and not menu_has(mp_reader_items, "WeRead: Upload progress")
         and menu_has(mp_reader_items, "Book details")
         and menu_has(mp_reader_items, "Underlines and thoughts management"),
     "public-account menu exposed unsupported progress or local-book actions")

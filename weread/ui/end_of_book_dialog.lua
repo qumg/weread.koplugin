@@ -24,8 +24,9 @@ local M = {}
 --   opts.enable_* : boolean — whether each context-dependent action is enabled
 --   opts.annotations_visible : boolean — current annotation visibility state
 --   callbacks             : { on_bookshelf, on_search, on_chapter_list, on_next,
---                             on_book_details, on_read_stats, on_sync_progress,
---                             on_toggle_annotations, on_close_book }
+--                             on_book_details, on_read_stats, on_upload_progress,
+--                             on_sync_progress, on_toggle_annotations,
+--                             on_close_book }
 -- Returns the dialog widget instance.
 function M.show(opts, callbacks)
     opts = opts or {}
@@ -91,15 +92,22 @@ function M.show(opts, callbacks)
         },
     })
 
-    -- Penultimate row: progress sync and the shared annotation visibility
-    -- toggle. Keep both visible; unsupported context is represented by a
-    -- disabled sync button instead of a no-op/error after tapping.
+    -- Progress row: upload (write-only) and the existing pull-then-choose sync.
+    -- Unsupported context disables both buttons instead of erroring after tap.
     table.insert(buttons, {
+        {
+            text = _("WeRead: Upload progress"),
+            enabled = opts.enable_upload_progress ~= false,
+            callback = function() dismiss_then(callbacks.on_upload_progress) end,
+        },
         {
             text = _("Sync progress now"),
             enabled = opts.enable_sync_progress ~= false,
             callback = function() dismiss_then(callbacks.on_sync_progress) end,
         },
+    })
+
+    table.insert(buttons, {
         {
             text = opts.annotations_visible == false
                 and _("Show underlines and thoughts")

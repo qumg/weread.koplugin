@@ -1,5 +1,7 @@
 # WeRead KOReader Plugin
 
+本仓库是 [finlater/weread.koplugin](https://github.com/finlater/weread.koplugin) 的个人 fork（[qumg/weread.koplugin](https://github.com/qumg/weread.koplugin)）。安装包和在线更新都使用本仓库的 GitHub Release，不会覆盖成上游官方包。
+
 > **免责声明**：本项目仅供个人学习和技术研究使用，不得用于商业用途。使用本项目所产生的一切后果（包括但不限于账号封禁、数据丢失等）由使用者自行承担，项目作者概不负责。请遵守微信读书的用户协议和相关法律法规。
 
 在 KOReader 上阅读微信读书中的书籍、公众号文章的插件。支持同步进度同步，阅读时长同步和统计，查看书评、划线和想法。让Kindle、Kobo等封闭系统设备也能体验微信读书！
@@ -8,7 +10,7 @@
 
 > ⚠️ 建议使用 **KOReader 2026.03 或更高版本**。旧版本可能无法正常加载或使用插件，例如「工具」菜单中找不到「微信读书」。详见 [#14](https://github.com/finlater/weread.koplugin/issues/14)。
 
-1. 前往 [GitHub Releases](https://github.com/finlater/weread.koplugin/releases) 下载最新的 `weread.koplugin-vX.Y.Z.zip` 安装包。
+1. 前往 [GitHub Releases](https://github.com/qumg/weread.koplugin/releases) 下载最新的 `weread.koplugin-vX.Y.Z.zip` 安装包。
 2. 解压安装包，得到 `weread.koplugin` 文件夹。
 3. 将该文件夹复制到 KOReader 的 `plugins` 目录：
 

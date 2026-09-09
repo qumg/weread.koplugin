@@ -101,6 +101,7 @@ expect(dialog_options.show_chapter_nav and dialog_options.show_next_chapter
         and dialog_options.enable_next_chapter == false
         and dialog_options.enable_book_details == false
         and dialog_options.enable_sync_progress == false
+        and dialog_options.enable_upload_progress == false
         and dialog_options.annotations_visible == true,
     "quick menu reflects the global annotation visibility preference")
 annotation_cache.show_annotations = false
@@ -127,12 +128,17 @@ expect(context_host:showEndOfBookDialog("mp-book"),
 expect(dialog_options.enable_book_details == true
         and dialog_options.enable_chapter_list == false
         and dialog_options.enable_next_chapter == false
-        and dialog_options.enable_sync_progress == false,
+        and dialog_options.enable_sync_progress == false
+        and dialog_options.enable_upload_progress == false,
     "public account articles only enable supported contextual actions")
 notice = nil
 dialog_callbacks.on_sync_progress()
 expect(notice and notice.timeout == 1,
     "public account article explains that progress sync needs a regular book")
+notice = nil
+dialog_callbacks.on_upload_progress()
+expect(notice and notice.timeout == 1,
+    "public account article explains that upload needs a regular book")
 
 print(string.format(
     "reader_quick_menu_spec: %d checks, %d failure(s)", checks, failures))

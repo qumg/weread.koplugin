@@ -116,11 +116,9 @@ function PositionMapper.normalize_remote(value, book_id, source, chapters)
     local map = catalog(chapters)
     local item = remote.chapter_uid ~= nil
         and map.by_uid[tostring(remote.chapter_uid)] or nil
-    if item and remote.has_chapter_offset
-        and item.words > 0 and map.total_words > 0 then
-        local offset = clamp(remote.chapter_offset, 0, item.words)
+    if item and remote.has_chapter_offset and map.total_words > 0 then
         remote.percent = clamp(
-            (item.before + offset) / map.total_words * 100,
+            (item.before + remote.chapter_offset) / map.total_words * 100,
             0,
             100
         )
@@ -129,6 +127,36 @@ function PositionMapper.normalize_remote(value, book_id, source, chapters)
         remote.position_basis = "raw_percent"
     end
     return remote
+end
+
+function PositionMapper.from_located(chapters, located)
+    if type(located) ~= "table" then return nil, "position_unavailable" end
+    local map = catalog(chapters)
+    local uid = located.chapter_uid or located.chapterUid or located.chapterId
+    local item = uid ~= nil and map.by_uid[tostring(uid)] or nil
+    if not item then return nil, "current_chapter_not_found" end
+    local offset = math.max(0, tonumber(located.chapter_offset) or 0)
+    local overall_fraction = 0
+    if map.total_words > 0 then
+        overall_fraction = clamp(
+            (item.before + offset) / map.total_words, 0, 1)
+    end
+    local chapter_fraction = 0
+    if item.words > 0 then
+        chapter_fraction = clamp(offset / item.words, 0, 1)
+    end
+    return {
+        percent = math.floor(clamp(overall_fraction, 0, 1) * 100),
+        fraction = clamp(overall_fraction, 0, 1),
+        chapter_uid = item.uid,
+        chapter_idx = item.chapter_idx,
+        chapter_offset = math.floor(offset),
+        has_chapter_offset = located.has_chapter_offset ~= false,
+        chapter_fraction = chapter_fraction,
+        summary = tostring(located.summary or ""),
+        safe = true,
+        is_full_book = located.is_full_book == true,
+    }
 end
 
 function PositionMapper.choose_remote(web, gateway, threshold)
@@ -243,11 +271,12 @@ function PositionMapper.remote_to_local(chapters, remote, options)
     if not target then
         return nil, "remote_chapter_not_found"
     end
-    if chapter_fraction == nil then
+    local has_summary = tostring(remote.summary or "") ~= ""
+    if chapter_fraction == nil and not has_summary then
         return nil, "remote_offset_unavailable"
     end
     return {
-        fraction = clamp(chapter_fraction, 0, 1),
+        fraction = clamp(chapter_fraction or 0, 0, 1),
         overall_fraction = clamp(overall_fraction, 0, 1),
         chapter = target.source,
         same_chapter = same_chapter,
@@ -255,31 +284,48 @@ function PositionMapper.remote_to_local(chapters, remote, options)
     }
 end
 
+local function normalize_summary(value)
+    return tostring(value or ""):gsub("·", "."):gsub("．", "."):gsub("•", ".")
+        :gsub("%s+", "")
+end
+
+local function summaries_match(left, right)
+    local a = normalize_summary(left)
+    local b = normalize_summary(right)
+    return a ~= "" and a == b
+end
+
 function PositionMapper.compare(local_position, remote, threshold)
     if type(local_position) ~= "table" or type(remote) ~= "table" then
         return "unknown", 0
     end
-    threshold = math.max(0, tonumber(threshold) or 2)
-    local delta = (tonumber(remote.percent) or 0)
-        - (tonumber(local_position.percent) or 0)
+    threshold = math.max(0, tonumber(threshold) or 80)
+    local offset_delta = (tonumber(remote.chapter_offset) or 0)
+        - (tonumber(local_position.chapter_offset) or 0)
     if local_position.chapter_uid ~= nil and remote.chapter_uid ~= nil
         and tostring(local_position.chapter_uid)
-            ~= tostring(remote.chapter_uid)
-        and math.abs(delta) <= threshold then
-        return "different", delta
+            ~= tostring(remote.chapter_uid) then
+        return "different", offset_delta
     end
-    if math.abs(delta) <= threshold then return "same", delta end
-    return delta > 0 and "remote_ahead" or "local_ahead", delta
+    if summaries_match(local_position.summary, remote.summary) then
+        return "same", offset_delta
+    end
+    if math.abs(offset_delta) <= threshold then return "same", offset_delta end
+    return offset_delta > 0 and "remote_ahead" or "local_ahead", offset_delta
 end
 
 function PositionMapper.same_position(left, right, tolerance)
     if type(left) ~= "table" or type(right) ~= "table" then return false end
-    tolerance = math.max(0, tonumber(tolerance) or 0.5)
-    return math.abs((tonumber(left.percent) or 0) - (tonumber(right.percent) or 0))
-            <= tolerance
-        and tostring(left.chapter_uid or "") == tostring(right.chapter_uid or "")
-        and math.abs((tonumber(left.chapter_offset) or 0)
-            - (tonumber(right.chapter_offset) or 0)) <= 1
+    tolerance = math.max(0, tonumber(tolerance) or 1)
+    if tostring(left.chapter_uid or "") ~= tostring(right.chapter_uid or "") then
+        return false
+    end
+    if summaries_match(left.summary, right.summary) then
+        return math.abs((tonumber(left.chapter_offset) or 0)
+            - (tonumber(right.chapter_offset) or 0)) <= math.max(tolerance, 1)
+    end
+    return math.abs((tonumber(left.chapter_offset) or 0)
+        - (tonumber(right.chapter_offset) or 0)) <= tolerance
 end
 
 return PositionMapper

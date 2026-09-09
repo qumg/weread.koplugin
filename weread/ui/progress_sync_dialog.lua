@@ -15,22 +15,32 @@ local function percent(position)
     return string.format("%.0f", tonumber(position and position.percent) or 0)
 end
 
+local function describe(position)
+    local pct = percent(position)
+    local summary = tostring(position and position.summary or "")
+        :gsub("^%s+", ""):gsub("%s+$", "")
+    if summary ~= "" then
+        return T(_("%1 (%2%)"), summary, pct)
+    end
+    return T(_("%1%"), pct)
+end
+
 function ProgressSyncDialog.show_choice(context)
     local message
     if context.source_conflict then
         message = T(_(
             "WeRead's two progress sources disagree for \"%1\".\n\n"
-            .. "KOReader: %2%\nSelected cloud position: %3%\n\n"
+            .. "KOReader: %2\nSelected cloud position: %3\n\n"
             .. "Choose which position to keep."
-        ), context.book_title, percent(context.local_position),
-            percent(context.remote_position))
+        ), context.book_title, describe(context.local_position),
+            describe(context.remote_position))
     else
         message = T(_(
             "Reading progress differs for \"%1\".\n\n"
-            .. "KOReader: %2%\nWeRead: %3%\n\n"
+            .. "KOReader: %2\nWeRead: %3\n\n"
             .. "Choose which position to keep."
-        ), context.book_title, percent(context.local_position),
-            percent(context.remote_position))
+        ), context.book_title, describe(context.local_position),
+            describe(context.remote_position))
     end
 
     UIManager:show(ConfirmBox:new{

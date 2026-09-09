@@ -580,6 +580,37 @@ test("a fresh automatic pull replaces an older retry chain", function()
     eq(#f.queue, 1, "replacement chain remains active")
 end)
 
+test("manual upload writes local progress without pulling", function()
+    local f = fixture({
+        bookId = "book",
+        progress = 80,
+        chapterUid = 33,
+        chapterIdx = 3,
+        chapterOffset = 500,
+        updateTime = 10,
+    })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(f.sync:upload_now(), true, "upload starts")
+    eq(#f.uploads, 1, "local position uploaded once")
+    eq(f.uploads[1].chapter_uid, 22, "upload uses the open chapter")
+    eq(#f.choices, 0, "upload does not open the conflict dialog")
+    eq(#f.notifications, 1, "upload notifies once")
+    eq(f.notifications[1].code, "upload_success", "success is reported")
+    eq(f.sync:status().verified, true, "successful upload verifies the session")
+end)
+
+test("manual upload stays silent about cloud progress when offline", function()
+    local f = fixture({}, {
+        is_online = function() return false end,
+    })
+    eq(f.sync:upload_now(), false, "offline upload does not start")
+    eq(#f.uploads, 0, "offline upload does not write")
+    eq(#f.choices, 0, "offline upload does not prompt")
+    eq(f.notifications[1].code, "offline", "offline message is explicit")
+end)
+
 print(string.format(
     "progress_sync_spec: %d checks, %d failure(s)", checks, failures))
 os.exit(failures == 0 and 0 or 1)
