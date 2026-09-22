@@ -11,6 +11,7 @@ local reset_count = 0
 local requests = {}
 local responses = {}
 local logs = {}
+local sleep_calls = {}
 
 package.preload["ltn12"] = function()
     return {
@@ -31,7 +32,15 @@ package.preload["logger"] = function()
     end
     return {
         info = function(...) capture("info", ...) end,
+        warn = function(...) capture("warn", ...) end,
         err = function(...) capture("error", ...) end,
+    }
+end
+package.preload["socket"] = function()
+    return {
+        sleep = function(seconds)
+            sleep_calls[#sleep_calls + 1] = seconds
+        end,
     }
 end
 package.preload["socketutil"] = function()
@@ -118,6 +127,74 @@ end)
 expect(not ok and tostring(err):find("transport failed", 1, true),
     "transport error was not propagated")
 expect(reset_count == 3, "timeout was not reset after transport error")
+expect(#sleep_calls == 0, "non-retryable transport error slept before failing")
+
+local request_count_before_nil_retry = #requests
+responses[#responses + 1] = { body = "", code = nil, status = "timeout" }
+responses[#responses + 1] = {
+    body = "recovered",
+    code = 200,
+    headers = { ["content-type"] = "text/plain" },
+}
+local recovered_body, recovered_code = client:request({
+    url = "https://weread.qq.com/web/wake",
+})
+expect(recovered_body == "recovered" and recovered_code == 200,
+    "nil-status transport failure was not retried successfully")
+expect(#requests == request_count_before_nil_retry + 2,
+    "nil-status retry did not issue exactly one follow-up request")
+expect(#sleep_calls == 1 and sleep_calls[1] == 1.5,
+    "nil-status retry did not sleep the configured delay")
+
+local request_count_before_timeout_retry = #requests
+local sleep_before_timeout_retry = #sleep_calls
+responses[#responses + 1] = { raise = "timeout" }
+responses[#responses + 1] = { raise = "timeout" }
+responses[#responses + 1] = { raise = "timeout" }
+ok, err = pcall(function()
+    client:request({ url = "https://weread.qq.com/web/still-down" })
+end)
+expect(not ok and tostring(err):find("timeout", 1, true),
+    "exhausted transport retries did not surface the original error")
+expect(#requests == request_count_before_timeout_retry + 3,
+    "timeout retries did not attempt the configured maximum")
+expect(#sleep_calls == sleep_before_timeout_retry + 2,
+    "timeout retries did not sleep between attempts")
+
+local request_count_before_http_error = #requests
+local sleep_before_http_error = #sleep_calls
+responses[#responses + 1] = {
+    body = "{\"errcode\":-202}",
+    code = 499,
+    headers = { ["content-type"] = "application/json" },
+}
+local rejected_body, rejected_code = client:request({
+    url = "https://weread.qq.com/web/business-error",
+})
+expect(rejected_code == 499 and type(rejected_body) == "string",
+    "HTTP business failure was altered by transport retry")
+expect(#requests == request_count_before_http_error + 1,
+    "HTTP business failure was incorrectly retried")
+expect(#sleep_calls == sleep_before_http_error,
+    "HTTP business failure slept as if it were a transport retry")
+
+local sink_chunks = {}
+local request_count_before_sink = #requests
+local sleep_before_sink = #sleep_calls
+responses[#responses + 1] = { body = "", code = nil, status = "timeout" }
+local sink_body, sink_code = client:request({
+    url = "https://weread.qq.com/web/stream",
+    sink = function(chunk)
+        if chunk then sink_chunks[#sink_chunks + 1] = chunk end
+        return 1
+    end,
+})
+expect(sink_code == nil and sink_body == nil,
+    "custom-sink nil status should return without inventing a body")
+expect(#requests == request_count_before_sink + 1,
+    "custom-sink request was incorrectly retried")
+expect(#sleep_calls == sleep_before_sink,
+    "custom-sink request slept for a transport retry")
 
 responses[#responses + 1] = {
     body = "",

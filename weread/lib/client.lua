@@ -11,8 +11,30 @@ if not ok_json then
 end
 
 local DEFAULT_TIMEOUT_SECONDS = 15
+-- After long Kindle sleep, Wi-Fi can look "online" while the first TCP/TLS
+-- attempt still returns nil status. Retry only those transport failures.
+local TRANSPORT_RETRY_LIMIT = 2
+local TRANSPORT_RETRY_DELAY_SECONDS = 1.5
 local Client = {}
 Client.__index = Client
+
+local function is_retryable_transport_error(err)
+    local text = tostring(err or ""):lower()
+    return text:find("timeout", 1, true) ~= nil
+        or text:find("wantread", 1, true) ~= nil
+        or text:find("wantwrite", 1, true) ~= nil
+        or text:find("closed", 1, true) ~= nil
+        or text:find("connection", 1, true) ~= nil
+        or text:find("network is unreachable", 1, true) ~= nil
+        or text:find("request failed", 1, true) ~= nil
+end
+
+local function sleep_transport_retry()
+    local ok_socket, socket = pcall(require, "socket")
+    if ok_socket and socket and socket.sleep then
+        socket.sleep(TRANSPORT_RETRY_DELAY_SECONDS)
+    end
+end
 
 local function header_value(headers, name)
     if type(headers) ~= "table" or type(name) ~= "string" then return nil end
@@ -226,12 +248,13 @@ end
 function Client:request(opts)
     opts = opts or {}
     local body = opts.body
-    local response
     local headers = {
         ["User-Agent"] = WeRead.USER_AGENT,
         ["Accept"] = "application/json, text/plain, */*"
     }
     local is_handle_cookie = not opts.skip_cookie and is_weread_url(opts.url)
+    -- Streaming sinks may already have written bytes; do not replay them.
+    local allow_transport_retry = opts.sink == nil
 
     if is_handle_cookie then
         local cookies = self.settings:get("cookies", {})
@@ -252,44 +275,84 @@ function Client:request(opts)
     elseif type(opts.timeout) == "number" then
         block_timeout = opts.timeout
     end
-    socketutil:set_timeout(block_timeout, total_timeout)
 
-    local sink_to_use = opts.sink
-    if not sink_to_use then
-        response = {}
-        sink_to_use = socketutil.table_sink(response)
+    local diagnostic_api = opts.diagnostic_api
+    local attempt = 0
+    local max_attempts = allow_transport_retry and (1 + TRANSPORT_RETRY_LIMIT) or 1
+    local response, raw_code, resp_headers, status, code, req_opts
+
+    while attempt < max_attempts do
+        attempt = attempt + 1
+        local sink_chunks
+        local sink_to_use = opts.sink
+        if not sink_to_use then
+            sink_chunks = {}
+            sink_to_use = socketutil.table_sink(sink_chunks)
+        end
+
+        req_opts = merge_req_opts({
+            method = body and "POST" or "GET",
+            source = body and ltn12.source.string(body) or nil,
+            sink = sink_to_use,
+            headers = headers,
+        }, opts)
+        -- Redirects are handled explicitly by request_follow so credentials can
+        -- be rebuilt for every destination instead of being copied across origins.
+        req_opts.redirect = false
+        req_opts.diagnostic_api = nil
+
+        socketutil:set_timeout(block_timeout, total_timeout)
+        local results = { pcall(http.request, req_opts) }
+        socketutil:reset_timeout()
+
+        if not results[1] then
+            local transport_err = results[2]
+            logger.err(
+                "HTTP transport failed:",
+                "method=", tostring(req_opts.method),
+                "url=", tostring(req_opts.url),
+                "api=", tostring(diagnostic_api or "unknown"),
+                "attempt=", tostring(attempt),
+                "error=", tostring(transport_err)
+            )
+            if allow_transport_retry
+                and attempt < max_attempts
+                and is_retryable_transport_error(transport_err) then
+                logger.warn(
+                    "HTTP transport retry:",
+                    "method=", tostring(req_opts.method),
+                    "url=", tostring(req_opts.url),
+                    "api=", tostring(diagnostic_api or "unknown"),
+                    "attempt=", tostring(attempt + 1)
+                )
+                sleep_transport_retry()
+            else
+                error(transport_err)
+            end
+        else
+            raw_code, resp_headers, status = results[3], results[4], results[5]
+            if status == nil and type(raw_code) == "string" then
+                status = raw_code
+            end
+            if not opts.sink then
+                response = table.concat(sink_chunks)
+            end
+            code = tonumber(raw_code)
+            if code or not allow_transport_retry or attempt >= max_attempts then
+                break
+            end
+            logger.warn(
+                "HTTP response unavailable; retrying:",
+                "method=", tostring(req_opts.method),
+                "url=", tostring(req_opts.url),
+                "api=", tostring(diagnostic_api or "unknown"),
+                "attempt=", tostring(attempt + 1),
+                "status=", tostring(status or raw_code)
+            )
+            sleep_transport_retry()
+        end
     end
 
-    local req_opts = merge_req_opts({
-        method = body and "POST" or "GET",
-        source = body and ltn12.source.string(body) or nil,
-        sink = sink_to_use,
-        headers = headers,
-    }, opts)
-    -- Redirects are handled explicitly by request_follow so credentials can be
-    -- rebuilt for every destination instead of being copied across origins.
-    req_opts.redirect = false
-    local diagnostic_api = req_opts.diagnostic_api
-    req_opts.diagnostic_api = nil
-
-    local results = { pcall(http.request, req_opts) }
-    socketutil:reset_timeout()
-    if not results[1] then
-        logger.err(
-            "HTTP transport failed:",
-            "method=", tostring(req_opts.method),
-            "url=", tostring(req_opts.url),
-            "api=", tostring(diagnostic_api or "unknown"),
-            "error=", tostring(results[2])
-        )
-        error(results[2])
-    end
-    local _, raw_code, resp_headers, status = results[2], results[3], results[4], results[5]
-    if status == nil and type(raw_code) == "string" then
-        status = raw_code
-    end
-
-    if not opts.sink then response = table.concat(response) end
     if is_handle_cookie and opts.persist_response_cookies ~= false then
         local set_cookie = header_value(resp_headers, "set-cookie")
         if set_cookie then
@@ -297,7 +360,6 @@ function Client:request(opts)
         end
     end
 
-    local code = tonumber(raw_code)
     if code and code >= 400 then
         log_response("HTTP response failed:", {
             method = req_opts.method,
