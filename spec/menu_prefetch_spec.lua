@@ -378,7 +378,7 @@ for _, item in ipairs(download_items or {}) do
     if item.text == "Hide footnote text" then footnote_popup = item end
 end
 expect(prefetch ~= nil, "download settings contain a prefetch submenu")
-expect(footnote_popup ~= nil, "download settings keep Hide footnote text (fork batch 6 skipped)")
+expect(footnote_popup == nil, "footnote display is controlled by the reader")
 
 local prefetch_items = prefetch and prefetch.sub_item_table_func() or {}
 expect(#prefetch_items == 3, "chapter prefetch contains its two related preferences")
