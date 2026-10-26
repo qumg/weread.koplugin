@@ -49,6 +49,7 @@ local started = perf("context_begin", nil)
 wall_now = wall_now + 29000000
 perf("chapter_source_cache", started, "book_id=", "fixture")
 local args = calls[#calls].args
+expect(calls[#calls].level == "dbg", "opening diagnostics must stay on dbg by default")
 expect(args[2] == "reader_open_perf" and args[4] == "chapter_source_cache",
     "opening stage is not identifiable in the log")
 expect(args[5] == "wall_ms=" and args[6] == "29000.0",

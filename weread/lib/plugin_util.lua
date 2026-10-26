@@ -48,9 +48,10 @@ function PluginUtil.thought_perf(stage, started, ...)
 end
 
 -- KOReader's monotonic clock includes I/O and time spent yielding to the UI.
+-- Keep these diagnostics on dbg so normal reading devices stay quiet.
 function PluginUtil.reader_open_perf(stage, started, ...)
     local now = time.now()
-    logger.info("reader_open_perf", "stage=", stage,
+    logger.dbg("reader_open_perf", "stage=", stage,
         "wall_ms=", string.format("%.1f", started and tonumber(now - started) / 1000 or 0), ...)
     return now
 end

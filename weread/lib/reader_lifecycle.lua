@@ -184,11 +184,25 @@ end
 
 function M:onPageUpdate()
     self.progress_sync:on_page_update()
+    -- Cancel any pending scroll debounce so the page turn paints marks promptly.
+    self._annotation_pos_refresh_token = (self._annotation_pos_refresh_token or 0) + 1
     if self._refreshAnnotationOverlay then self:_refreshAnnotationOverlay() end
 end
 
 function M:onPosUpdate()
-    if self._refreshAnnotationOverlay then self:_refreshAnnotationOverlay() end
+    if not self._refreshAnnotationOverlay then return end
+    -- Continuous scroll can fire many PosUpdate events; coalesce them so old
+    -- devices are not re-walking chapter windows on every tiny move.
+    if type(UIManager.scheduleIn) ~= "function" then
+        self:_refreshAnnotationOverlay()
+        return
+    end
+    self._annotation_pos_refresh_token = (self._annotation_pos_refresh_token or 0) + 1
+    local token = self._annotation_pos_refresh_token
+    UIManager:scheduleIn(0.12, function()
+        if token ~= self._annotation_pos_refresh_token then return end
+        if self._refreshAnnotationOverlay then self:_refreshAnnotationOverlay() end
+    end)
 end
 
 function M:onCloseDocument()

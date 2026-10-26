@@ -630,7 +630,7 @@ function M:ensureAnnotationDisplay()
     if summary and summary.chapters > 0 then return false end
     local ConfirmBox = require("ui/widget/confirmbox")
     UIManager:show(ConfirmBox:new{
-        text = T(_("Match underlines and thoughts for “%1”?\nOnly chapters in this file are processed. Future prefetched chapters can prepare annotations automatically."), binding.title or binding.book_id),
+        text = T(_("Match underlines and thoughts for “%1”?\nOnly chapters in this file are processed. Prefetch can prepare later chapters when both chapter prefetch and annotation prefetch are on. Opening a book still matches already cached chapters."), binding.title or binding.book_id),
         ok_text = _("Start matching"), cancel_text = _("Later"),
         ok_callback = function()
             local cache = self.settings:get("cache")
