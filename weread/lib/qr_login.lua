@@ -126,7 +126,7 @@ function QRLogin:_request_json(url, opts, stage)
 end
 
 function QRLogin:_begin_protocol()
-    local login_cookies = {}
+    local login_cookies = { wr_fp = self.settings:get_device_fingerprint() }
     local _, page_code, page_headers = self.client:request_follow({
         url = SKILLS_PAGE_URL,
         method = "GET",
@@ -136,6 +136,7 @@ function QRLogin:_begin_protocol()
         headers = {
             ["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             ["Referer"] = BASE_URL .. "/",
+            ["Cookie"] = Cookie.to_header(login_cookies),
         },
     })
     login_cookies = merge_response_cookies(login_cookies, page_headers)
@@ -171,9 +172,9 @@ function QRLogin:_poll_protocol(uid, otp)
         error("Missing QR login UID")
     end
 
-    local url = LOGIN_INFO_URL .. "?uid=" .. WeRead.urlencode(uid) .. "&otp"
+    local url = LOGIN_INFO_URL .. "?uid=" .. WeRead.urlencode(uid) .. "&otp="
     if type(otp) == "string" and otp ~= "" then
-        url = url .. "=" .. WeRead.urlencode(otp)
+        url = url .. WeRead.urlencode(otp)
     end
 
     local headers = {
@@ -191,10 +192,9 @@ function QRLogin:_poll_protocol(uid, otp)
         headers = headers,
     }, "getLoginInfo")
     if not data then
-        if is_timeout_error(request_error) or request_error == "request failed" then
-            return { transport_pending = true }
-        end
-        error(request_error)
+        -- No HTTP status means the socket failed. Keep polling until the QR session expires.
+        logger.dbg("getLoginInfo transport pending:", tostring(request_error))
+        return { transport_pending = true }
     end
     self.login_cookies = merge_response_cookies(self.login_cookies, response_headers)
     return data
@@ -375,8 +375,13 @@ function QRLogin:_show_qr(uid, generation)
         scale_factor = 0.9,
     }
     self.qr_dialog = dialog
-    UIManager:show(dialog)
-    self.host:refreshUI()
+    -- Show the QR dialog after the surrounding UI has finished updating.
+    -- Showing it immediately can leave part of the QR code obscured on Kindle.
+    UIManager:scheduleIn(0.2, function()
+        if generation == self.generation and self.qr_dialog == dialog then
+            UIManager:show(dialog)
+        end
+    end)
 
     UIManager:scheduleIn(0.5, function()
         if generation == self.generation and self.qr_dialog == dialog then

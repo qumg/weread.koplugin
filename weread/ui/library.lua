@@ -3,7 +3,7 @@ local BookReviews = require("weread.lib.book_reviews")
 local BookReviewsView = require("weread.ui.book_reviews_view")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Content = require("weread.lib.content")
-local CoverLayout = require("weread.lib.cover_layout")
+local ShelfGroups = require("weread.lib.shelf_groups")
 local InputDialog = require("ui/widget/inputdialog")
 local logger = require("weread.lib.logger")
 local ProgressbarDialog = require("ui/widget/progressbardialog")
@@ -70,9 +70,29 @@ end
 
 function M:showBookshelf()
     local cached = self.library_db and self.library_db:getShelf() or nil
-    if cached and #cached > 0 then
-        self:applyShelfSnapshot(cached)
+    local archives = self.library_db and self.library_db:getShelfArchives() or nil
+    if cached and (#cached > 0 or archives ~= nil) then
+        self:applyShelfSnapshot(cached, archives)
         self:showShelfView("books")
+        local shelf = self.settings:get("shelf")
+        -- Only old caches lack archive metadata; an empty archive is current.
+        if archives == nil and not shelf.groups_refresh_hint_shown then
+            local view = self.shelf_view
+            local hint = ConfirmBox:new{
+                text = _("Get the latest bookshelf to show your WeRead book groups.\n\nYou can also do this later with the refresh button in the top bar."),
+                ok_text = _("Get latest"), cancel_text = _("Later"),
+                ok_callback = function()
+                    UIManager:nextTick(function()
+                        if self.shelf_view == view then view.on_refresh() end
+                    end)
+                end,
+            }
+            hint.movable[1].radius = 0
+            UIManager:show(hint)
+            shelf.groups_refresh_hint_shown = true
+            self.settings:set("shelf", shelf)
+            self.settings:flush()
+        end
         return
     end
     self:refreshBookshelf()
@@ -101,11 +121,13 @@ function M:onWeReadAccountChanged()
     self.shelf_regular = nil
     self.shelf_mp = nil
     self.shelf_books = nil
+    self.shelf_groups = nil
+    self.shelf_group_key = nil
     self.shelf_search_keyword = nil
     self.shelf_view_pages = nil
 end
 
-function M:applyShelfSnapshot(all_books)
+function M:applyShelfSnapshot(all_books, archives)
     local shelf = self.settings:get("shelf")
     self.shelf_filters = { reading = shelf.filter_reading, download = shelf.filter_download }
     self.shelf_regular = {}
@@ -118,17 +140,32 @@ function M:applyShelfSnapshot(all_books)
         end
     end
     self.shelf_books = self.shelf_regular
+    self.shelf_groups = ShelfGroups.list(archives, self.shelf_regular, _("Unnamed group"), _("Uncategorized"))
+    if self.shelf_group_key and not ShelfGroups.find(self.shelf_groups, self.shelf_group_key) then
+        self.shelf_group_key = nil
+        if self.shelf_view_pages then self.shelf_view_pages.books = 1 end
+    end
 end
 
 function M:refreshBookshelf(old_view, view_options)
-    if not self:requireLogin(false, true) then return end
+    if self.shelf_refreshing or not self:requireLogin(false, true) then return end
+    self.shelf_refreshing = true
+    -- A finishing thumbnail batch must not replace the view being refreshed.
+    self.shelf_cover_generation = (self.shelf_cover_generation or 0) + 1
+    self.shelf_cover_pending = nil
+    if old_view then old_view:setRefreshing(true) end
+    local function done()
+        self.shelf_refreshing = nil
+        if old_view then old_view:setRefreshing(false) end
+        self:closeBusy()
+    end
     self:showBusy(_("Loading bookshelf..."))
-    self:runOnlineTask(_("Bookshelf"), function()
+    local started = self:runOnlineTask(_("Bookshelf"), function()
         local ok, result = pcall(function()
             return self.client:get_shelf()
         end)
+        done()
         if not ok then
-            self:closeBusy()
             logger.err("load bookshelf failed:", log_error(result))
             self:showInfo(T(
                 _("Load bookshelf failed:\n%1\n\nIf other account features still work, use Search to find and download books."),
@@ -140,19 +177,25 @@ function M:refreshBookshelf(old_view, view_options)
             and type(result.books) == "table"
             and result.books
             or {}
-        if self.library_db then
-            self.library_db:cacheShelf(all_books)
+        local archives = type(result) == "table" and type(result.archive) == "table" and result.archive or {}
+        if self.library_db then self.library_db:cacheShelf(all_books, archives) end
+        local old_group_key = self.shelf_group_key
+        self:applyShelfSnapshot(all_books, archives)
+        local next_options = {}
+        for key, value in pairs(view_options or {}) do next_options[key] = value end
+        next_options.prepared_shelf = nil
+        if old_group_key ~= self.shelf_group_key then
+            next_options.page, next_options.scroll_offset = 1, nil
         end
-        self:applyShelfSnapshot(all_books)
-        self:closeBusy()
         if old_view then UIManager:close(old_view) end
         self:showShelfView(
             view_options and view_options.mode or self.shelf_view_mode or "books",
             view_options and view_options.keyword or nil,
             nil,
-            view_options
+            next_options
         )
     end)
+    if started == false then done() end
 end
 
 local function shelf_search_match(book, keyword)
@@ -178,6 +221,19 @@ local function shelf_page_items(items, page, page_size)
     return result, page
 end
 
+-- Regular books already provide HTTPS covers. Public-account avatars are
+-- commonly returned as http://wx.qlogo.cn URLs; use the equivalent HTTPS URL
+-- so cover mode never requests an avatar over plaintext transport.
+local function shelf_cover_url(book)
+    local cover = type(book) == "table" and book.cover or nil
+    if type(cover) ~= "string" then return nil end
+    if cover:match("^https://") then return cover end
+    if cover:match("^http://wx%.qlogo%.cn/") then
+        return "https://" .. cover:sub(#"http://" + 1)
+    end
+    return nil
+end
+
 function M:getShelfCoverCache()
     if not self.shelf_cover_cache then
         local CoverCache = require("weread.lib.cover_cache")
@@ -186,15 +242,15 @@ function M:getShelfCoverCache()
     return self.shelf_cover_cache
 end
 
-function M:fetchVisibleShelfCovers(view, books, options)
-    if not view or not books or #books == 0 then return end
+function M:fetchVisibleShelfCovers(view, items, options)
+    if not view or not items or #items == 0 then return end
     options = options or {}
     local cache = self:getShelfCoverCache()
-    local visible = shelf_page_items(books, view.page, view.page_size or 6)
+    local visible = shelf_page_items(items, view.page, view.page_size or 6)
     local missing = {}
     local online = self:isNetworkOnline()
     for _, book in ipairs(visible) do
-        if type(book.cover) == "string" and book.cover:match("^https://")
+        if shelf_cover_url(book)
             and not cache:pathFor(book) then
             -- Legacy full-resolution cache entries can be converted while
             -- offline. A network request is only needed when no source exists.
@@ -207,7 +263,7 @@ function M:fetchVisibleShelfCovers(view, books, options)
 
     if self.shelf_cover_job then
         -- Keep only the newest visible page while the current child exits.
-        self.shelf_cover_pending = { view = view, books = books, options = options }
+        self.shelf_cover_pending = { view = view, items = items, options = options }
         return
     end
 
@@ -231,17 +287,17 @@ function M:fetchVisibleShelfCovers(view, books, options)
             local next_options = {}
             for key, value in pairs(options) do next_options[key] = value end
             next_options.prepared_shelf = {
-                books = books,
+                books = options.prepared_books or self.shelf_regular or {},
                 accounts = options.prepared_accounts or self.shelf_mp or {},
             }
             next_options.page = view.page
             next_options.skip_cover_fetch_once = true
-            self:showShelfView("books", self.shelf_search_keyword, view, next_options)
+            self:showShelfView(options.mode or "books", options.keyword, view, next_options)
         end
         local pending = self.shelf_cover_pending
         self.shelf_cover_pending = nil
         if pending then
-            self:fetchVisibleShelfCovers(pending.view, pending.books, pending.options)
+            self:fetchVisibleShelfCovers(pending.view, pending.items, pending.options)
         end
     end
 
@@ -260,7 +316,7 @@ function M:fetchVisibleShelfCovers(view, books, options)
             local ok, path = pcall(cache.thumbnailFromCached, cache, book)
             if not (ok and path) and online then
                 local downloaded, data = pcall(function()
-                    return self.client:get_binary(book.cover, {
+                    return self.client:get_binary(shelf_cover_url(book), {
                         skip_cookie = true,
                         persist_response_cookies = false,
                         timeout = { 8, 12 },
@@ -335,38 +391,30 @@ function M:showShelfView(mode, keyword, old_view, options)
         end
         return result
     end
+    local group = ShelfGroups.find(self.shelf_groups, self.shelf_group_key)
     local prepared = options.prepared_shelf
-    local books = prepared and prepared.books or filtered(self.shelf_regular, true)
+    local books = prepared and prepared.books or filtered(group and group.books or self.shelf_regular, true)
     local accounts = prepared and prepared.accounts or filtered(self.shelf_mp, false)
     local shelf_settings = self.settings:get("shelf")
-    local cover_mode = mode == "books" and shelf_settings.view_mode == "cover"
+    local cover_mode = shelf_settings.view_mode == "cover"
     local paged = cover_mode or shelf_settings.paginated ~= false
     local page = paged and (options.page or self.shelf_view_pages[mode] or 1) or 1
-    local cover_layout
-    if cover_mode then
-        local Screen = require("device").screen
-        local scaled_size = tonumber(Screen:scaleBySize(1000))
-        local size_scale = scaled_size and scaled_size > 0 and scaled_size / 1000 or 1
-        cover_layout = CoverLayout.calculate{
-            width = Screen:getWidth(),
-            height = Screen:getHeight(),
-            size_scale = size_scale,
-        }
-    end
-    local page_size = cover_layout and cover_layout.page_size
-        or math.max(4, list_items_per_page() - 4)
+    local source = mode == "public_account" and accounts or books
+    local layout = LibraryView.getLayout(cover_mode, #source, mode)
+    local cover_layout = cover_mode and layout or nil
+    local page_size = layout.page_size
     local cover_paths, cover_loading
     if cover_mode then
         cover_paths = {}
         cover_loading = {}
         local cache = self:getShelfCoverCache()
         local online = self:isNetworkOnline()
-        local visible, clamped_page = shelf_page_items(books, page, page_size)
+        local visible, clamped_page = shelf_page_items(source, page, page_size)
         page = clamped_page
         for _, book in ipairs(visible) do
             local path = cache:pathFor(book)
             cover_paths[book] = path
-            if not path and type(book.cover) == "string" and book.cover:match("^https://") then
+            if not path and shelf_cover_url(book) then
                 cover_loading[book] = online or cache:sourcePathFor(book) ~= nil
             end
         end
@@ -379,6 +427,11 @@ function M:showShelfView(mode, keyword, old_view, options)
         wp_enable = options.wp_enable,
         books = books,
         accounts = accounts,
+        groups = self.shelf_groups,
+        group_key = self.shelf_group_key,
+        group_label = group and group.label,
+        total_books = #(self.shelf_regular or {}),
+        scroll_offset = options.scroll_offset,
         keyword = keyword,
         sort_label = self:shelfSortSummary(),
         filter_label = self:shelfFilterSummary(),
@@ -397,24 +450,42 @@ function M:showShelfView(mode, keyword, old_view, options)
             for key, value in pairs(options) do next_options[key] = value end
             next_options.prepared_shelf = { books = books, accounts = accounts }
             next_options.page = self.shelf_view_pages[new_mode] or 1
+            next_options.scroll_offset = nil
             self:showShelfView(new_mode, keyword, view, next_options)
+        end,
+        on_select_group = function(key)
+            if key and not ShelfGroups.find(self.shelf_groups, key) then return end
+            self.shelf_group_key = key
+            local next_options = {}
+            for name, value in pairs(options) do next_options[name] = value end
+            next_options.prepared_shelf, next_options.scroll_offset = nil, nil
+            next_options.page = 1
+            self:showShelfView("books", keyword, view, next_options)
+        end,
+        on_display_change = function(key, value)
+            local shelf = self.settings:get("shelf")
+            shelf[key] = value
+            self.settings:set("shelf", shelf)
+            self.settings:flush()
+            options.page, options.scroll_offset = 1, nil
+            self:showShelfView(mode, keyword, view, options)
         end,
         on_search = function()
             self:showShelfSearchDialog(view, mode, keyword, options)
         end,
         on_refresh = function()
-            self.shelf_view_pages = { books = 1, public_account = 1 }
             local refresh_options = {}
             for key, value in pairs(options) do refresh_options[key] = value end
             refresh_options.prepared_shelf = nil
-            refresh_options.page = 1
+            refresh_options.page = view.page
+            refresh_options.scroll_offset = view:getScrollOffset()
             self:refreshBookshelf(view, refresh_options)
         end,
         on_sort = function()
             self:showShelfSortOptions(function()
                 self.shelf_view_pages = { books = 1, public_account = 1 }
                 options.prepared_shelf = nil
-                options.page = 1
+                options.page, options.scroll_offset = 1, nil
                 self:showShelfView(mode, keyword, view, options)
             end)
         end,
@@ -422,7 +493,7 @@ function M:showShelfView(mode, keyword, old_view, options)
             self:showShelfFilterOptions(function()
                 self.shelf_view_pages = { books = 1, public_account = 1 }
                 options.prepared_shelf = nil
-                options.page = 1
+                options.page, options.scroll_offset = 1, nil
                 self:showShelfView(mode, keyword, view, options)
             end)
         end,
@@ -449,8 +520,9 @@ function M:showShelfView(mode, keyword, old_view, options)
     if cover_mode and not skip_cover_fetch_once then
         local fetch_options = {}
         for key, value in pairs(options) do fetch_options[key] = value end
+        fetch_options.prepared_books = books
         fetch_options.prepared_accounts = accounts
-        self:fetchVisibleShelfCovers(view, books, fetch_options)
+        self:fetchVisibleShelfCovers(view, source, fetch_options)
     end
 end
 
@@ -467,7 +539,7 @@ function M:showShelfSearchDialog(view, mode, keyword, options)
                     UIManager:close(dialog)
                     self.shelf_view_pages = { books = 1, public_account = 1 }
                     options.prepared_shelf = nil
-                    options.page = 1
+                    options.page, options.scroll_offset = 1, nil
                     self:showShelfView(mode, nil, view, options)
                 end),
             },

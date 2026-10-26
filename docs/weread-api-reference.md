@@ -71,6 +71,30 @@ Response:
 
 On success, persist the returned `Set-Cookie` values. Avoid duplicated host-only and domain cookies for the same name; stale duplicate `wr_skey` can cause `登录超时`.
 
+### 1.3 QR Login Fingerprint
+
+The plugin keeps the existing `/api/auth/getLoginUid` →
+`/api/auth/getLoginInfo` flow. Before requesting a QR code, it generates and
+persists `device_fingerprint`, then sends it as the `wr_fp` cookie throughout
+login and saves it with the resulting session cookies. Logout clears account
+credentials but preserves this installation identity.
+
+The website uses an unsigned 32-bit decimal browser fingerprint. KOReader has
+no browser canvas, so the plugin uses four OS-random bytes in the same decimal
+format. It does not derive the value from the account or the shared User-Agent,
+and does not add `wr_gid`. Copying `device_fingerprint` to another installation
+also copies its identity; each installation should generate its own value.
+
+`scripts/verify_qr_login.py` sends `wr_fp` by default. Pass
+`--without-fingerprint` for the original flow as a control. In the 2026-10-03
+live comparison, two isolated sessions using the original flow reproduced
+replacement: after B logged in, A returned `-2012` and could not renew. With
+distinct `wr_fp` values and the same login endpoints and User-Agent, both
+sessions remained usable after B's login and after each session renewed.
+This verifies the protocol change in that run, not long-term behavior on every
+KOReader device. Existing logged-in sessions require a new QR login to exercise
+the changed credential-issuance request.
+
 ## 2. Official Skill Interfaces
 
 All endpoints below are called through:

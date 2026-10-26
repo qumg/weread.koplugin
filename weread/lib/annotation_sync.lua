@@ -5,6 +5,7 @@ local Chapters = require("weread.lib.annotation_chapters")
 local Source = require("weread.lib.annotation_source")
 local Sync = {}
 Sync.__index = Sync
+Sync.NETWORK_REQUIRED = "annotation_network_required"
 
 local function unique_underlines(rows)
     local seen, result = {}, {}
@@ -32,19 +33,40 @@ function Sync:yield(stage, delay, detail)
     coroutine.yield(state)
 end
 
+function Sync:requireNetwork()
+    if self.offline or (self.is_online and not self.is_online()) then
+        error(Sync.NETWORK_REQUIRED, 0)
+    end
+end
+
+-- The UI adapter runs yielded network work outside this pipeline coroutine.
+-- Only returned data is resumed here, so checkpoints and document access stay
+-- in the parent. Headless prefetch keeps its existing synchronous worker path.
+function Sync:callNetwork(fn)
+    if self.async_network then return coroutine.yield({ network = fn }) end
+    return fn()
+end
+
 function Sync:request(fn, progress)
-    if self.offline then error("Annotation data is not cached. Connect to continue.") end
+    self:requireNetwork()
     for attempt = 1, 3 do
         self:yield(progress and progress.stage or "download",
             attempt == 1 and 0.3 or 2 ^ attempt, progress)
-        local ok, data, err = fn()
+        self:requireNetwork()
+        local ok, data, err = self:callNetwork(fn)
         if ok and type(data) == "table" then return data end
+        self:requireNetwork()
         if attempt == 3 then error(err or "Invalid annotation response") end
     end
 end
 
 function Sync:run()
     local store, book_id = self.store, self.book_id
+    if self.clear_existing then
+        self:requireNetwork()
+        store:clearChapters(book_id, self.chapters)
+        if self.on_reset then self.on_reset() end
+    end
     if self.refresh then
         local changes = {}
         for _, chapter in ipairs(self.chapters) do
@@ -59,6 +81,8 @@ function Sync:run()
     for index, chapter in ipairs(self.chapters) do
         self.index = index
         local uid = Chapters.uid(chapter)
+        local started = self.perf and self.perf("chapter_cache_begin", nil, "chapter_uid=", uid)
+        local range_key = Chapters.rangeKey(self.ranges and self.ranges[uid])
         local refreshing = store:get(book_id, "refresh", uid)
         local source_status = store:get(book_id, "source_status", uid)
         if source_status and not refreshing then
@@ -66,13 +90,24 @@ function Sync:run()
                 store:projectionKey(self.document_key, uid))
             if not self.document or (status
                 and status.revision == source_status.revision
-                and status.matcher_version == External.MATCHER_VERSION) then
+                and status.matcher_version == External.MATCHER_VERSION
+                and status.range_key == range_key) then
+                if self.perf then self.perf("chapter_cached", started, "chapter_uid=", uid) end
                 self.completed = self.completed + 1
                 self:yield("saved")
                 goto next_chapter
             end
         end
         local source = not refreshing and store:get(book_id, "source", uid)
+        -- Numeric generations are committed together with their per-range
+        -- thoughts below. Legacy imports have not materialized those yet.
+        local reuse_source = source and source_status
+            and source_status.revision == source.revision
+            and tonumber(source.revision) ~= nil
+        if self.perf then
+            started = self.perf("chapter_source_cache", started,
+                "chapter_uid=", uid, "cache_hit=", not not source)
+        end
         if not source then
             local stage = store:get(book_id, "download", uid)
             if not stage then
@@ -135,8 +170,10 @@ function Sync:run()
             end
             if missing then
                 local original = store:get(book_id, "original", uid)
-                if (not original or refreshing) and self.fetch_source and not self.offline then
+                if (not original or refreshing) and self.fetch_source then
+                    self:requireNetwork()
                     self:yield("source", 0.3)
+                    self:requireNetwork()
                     local fetched = self.fetch_source(chapter)
                     original = type(fetched) == "table" and fetched or Source.index(fetched)
                     store:put(book_id, "original", uid, original, uid)
@@ -150,24 +187,36 @@ function Sync:run()
                 end
             end
             source.revision = stage.revision
+            if self.perf then started = self.perf("chapter_source_ready", started, "chapter_uid=", uid) end
         end
         local projection, document_key = nil, self.document_key
         if self.document then
             local key = store:projectionKey(document_key, uid)
             projection = store:get(book_id, "projection", key)
+            if self.perf then
+                started = self.perf("chapter_projection_cache", started,
+                    "chapter_uid=", uid, "cache_hit=", projection ~= nil)
+            end
             if not projection or projection.revision ~= source.revision
-                or projection.matcher_version ~= External.MATCHER_VERSION then
+                or projection.matcher_version ~= External.MATCHER_VERSION
+                or projection.range_key ~= range_key then
                 local match_current = 0
                 self:yield("match", nil, { current = 0, count = #source.underlines })
                 local saved = store:get(book_id, "matching", key)
                 if saved and (saved.revision ~= source.revision
-                    or saved.matcher_version ~= External.MATCHER_VERSION) then
+                    or saved.matcher_version ~= External.MATCHER_VERSION or saved.range_key ~= range_key) then
                     saved = nil
                 end
                 if saved then match_current = math.max(0, (saved.next_index or 1) - 1) end
+                if self.perf then
+                    started = self.perf("chapter_match_begin", started,
+                        "chapter_uid=", uid, "underlines=", #source.underlines,
+                        "resumed=", saved ~= nil)
+                end
                 local records, stats = External.locate(self.document, { source }, {
                     chapter_ranges = self.ranges,
                     resume = saved,
+                    include_items = false,
                     yield = function(current, count)
                         if current then match_current = current end
                         self:yield("match", nil, {
@@ -175,48 +224,52 @@ function Sync:run()
                         })
                     end,
                     checkpoint = function(state)
+                        state.range_key = range_key
                         state.revision = source.revision
                         state.matcher_version = External.MATCHER_VERSION
                         store:put(book_id, "matching", key, state, uid)
                     end,
                 })
+                if self.perf then
+                    started = self.perf("chapter_match", started, "chapter_uid=", uid,
+                        "located=", stats.located, "unmatched=", stats.unmatched)
+                end
                 if projection and #(projection.records or {}) > 0
                     and stats.total > 0 and stats.located == 0 then
                     error("No underlines could be matched. Previous chapter results were preserved.")
                 end
-                -- Keep small position rows in the projection. Thoughts are
-                -- fetched on tap from the shared per-range cache below.
-                for _, record in ipairs(records) do record.items = nil end
-                projection = { revision = source.revision,
+                projection = { revision = source.revision, range_key = range_key,
                     matcher_version = External.MATCHER_VERSION, records = records,
                     stats = stats, complete = true }
             end
         end
-        local items = {}
-        for _, review in ipairs(source.reviews or {}) do
-            local range = tostring(review.range or "")
-            items[#items + 1] = { kind = "thought", key = uid .. ":" .. range, uid = uid,
-                value = require("weread.lib.annotations").buildThoughtPopupItems(review) }
+        -- Reprojection only changes coordinates. Keep the committed source
+        -- and thoughts intact instead of rebuilding and rewriting them.
+        local changes = {}
+        if not reuse_source then
+            changes = {
+                { kind = "source", key = uid, uid = uid, value = source },
+                { kind = "source_status", key = uid, uid = uid,
+                    value = { revision = source.revision, total = #source.underlines } },
+                { kind = "download", key = uid }, { kind = "batch", uid = uid },
+                { kind = "refresh", key = uid }, { kind = "thought", uid = uid },
+            }
+            for _, review in ipairs(source.reviews or {}) do
+                local range = tostring(review.range or "")
+                changes[#changes + 1] = { kind = "thought", key = uid .. ":" .. range, uid = uid,
+                    value = require("weread.lib.annotations").buildThoughtPopupItems(review) }
+            end
         end
-        -- Stage per-range items and the chapter snapshot in one transaction;
-        -- source/projection commit also removes the resumable staging rows.
-        local changes = {
-            { kind = "source", key = uid, uid = uid, value = source },
-            { kind = "source_status", key = uid, uid = uid,
-                value = { revision = source.revision, total = #source.underlines } },
-            { kind = "download", key = uid }, { kind = "batch", uid = uid },
-            { kind = "refresh", key = uid }, { kind = "thought", uid = uid },
-        }
-        for _, item in ipairs(items) do changes[#changes + 1] = item end
         if document_key then
             local key = store:projectionKey(document_key, uid)
             changes[#changes + 1] = { kind = "projection", key = key, uid = uid, value = projection }
             changes[#changes + 1] = { kind = "matching", key = key }
             changes[#changes + 1] = { kind = "status", key = key, uid = uid,
                 value = { stats = projection.stats, revision = projection.revision,
-                    matcher_version = projection.matcher_version } }
+                    matcher_version = projection.matcher_version, range_key = range_key } }
         end
         store:write(book_id, changes)
+        if self.perf then self.perf("chapter_save", started, "chapter_uid=", uid) end
         self.completed = self.completed + 1
         if self.on_chapter then self.on_chapter(uid, projection) end
         self:yield("saved")
@@ -225,9 +278,9 @@ function Sync:run()
     return { stage = "complete", completed = self.completed, total = #self.chapters }
 end
 
-function Sync:step()
+function Sync:step(...)
     if self.cancelled then return true, { stage = "paused" } end
-    local ok, value = coroutine.resume(self.thread)
+    local ok, value = coroutine.resume(self.thread, ...)
     if not ok then return nil, tostring(value) end
     return coroutine.status(self.thread) == "dead", value
 end

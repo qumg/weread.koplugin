@@ -119,6 +119,8 @@ end
 
 function M:onReaderReady()
     self._reader_session_gen = (self._reader_session_gen or 0) + 1
+    local perf = PluginUtil.reader_open_perf
+    local opened = perf("reader_ready_begin", nil, "session=", self._reader_session_gen)
     self:_teardownThoughtInterception()
     self:_installReaderHighlightTapGuard()
 
@@ -159,9 +161,12 @@ function M:onReaderReady()
     -- document. The view module remains empty until the user adds a prototype
     -- range, so unsupported/non-participating books pay only an empty module
     -- function call during paint.
+    local prepared = perf("reader_setup", opened, "book_id=", weread_book_id or "local")
     self:_setupXPointerOverlayPrototype()
+    perf("overlay_setup", prepared)
     if self.onUnifiedAnnotationsReady then self:onUnifiedAnnotationsReady() end
 
+    local annotations_ready = perf("annotations_ready", opened)
     self.progress_sync:on_reader_ready()
     local prefetch_session_gen = self._reader_session_gen
     UIManager:scheduleIn(0.2, function()
@@ -173,10 +178,17 @@ function M:onReaderReady()
     if rr.enabled and rr.mode == "auto" and reason == "document_not_weread" then
         self:showTransientInfo(_("Current book is not from WeRead, reading time not reported"), 1)
     end
+    perf("reader_services", annotations_ready)
+    perf("reader_ready_total", opened)
 end
 
 function M:onPageUpdate()
     self.progress_sync:on_page_update()
+    if self._refreshAnnotationOverlay then self:_refreshAnnotationOverlay() end
+end
+
+function M:onPosUpdate()
+    if self._refreshAnnotationOverlay then self:_refreshAnnotationOverlay() end
 end
 
 function M:onCloseDocument()
@@ -265,7 +277,8 @@ function M:maybePrefetchNextChapter(book_id)
         on_complete = function(ok, value)
             if ok then
                 -- A promoted prefetch opens the new file immediately. Its
-                -- ReaderReady path will prepare annotations for that file, so
+                -- ReaderReady path can download source data for that file
+                -- when both prefetch switches are enabled, so
                 -- do not fork an annotation worker only to cancel it during
                 -- the document switch.
                 if self.prefetchChapterAnnotations

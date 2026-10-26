@@ -14,7 +14,7 @@ local values = {
     wr_wrpa = "legacy-wrpa",
     account = { name = "legacy-user" },
     books = { ["42"] = { cache_dir = "/cache/42" } },
-    cache = { download_images = false },
+    cache = { download_images = false, book_footnotes_in_popup = true },
     config_loaded = true,
 }
 local flush_count = 0
@@ -48,6 +48,9 @@ package.preload["luasettings"] = function()
             return store
         end,
     }
+end
+package.preload["weread.lib.mock_environment"] = function()
+    return { active = function() return { enabled = false } end }
 end
 local created_dirs = {}
 package.preload["libs/libkoreader-lfs"] = function()
@@ -163,9 +166,49 @@ expect(values.download_dir == "/external/books",
 expect(settings:set_download_dir("") == "/data/weread/cache",
     "download directory did not reset to default")
 
+local original_environment = getfenv(Settings.get_device_fingerprint)
+local random_reads = 0
+local random_bytes = string.char(255, 254, 253, 252)
+local random_closed = false
+local function open_random(path, mode)
+    expect(path == "/dev/urandom" and mode == "rb", "wrong randomness source")
+    random_reads = random_reads + 1
+    return {
+        read = function(_self, length)
+            expect(length == 4, "fingerprint should use 32 random bits")
+            return random_bytes
+        end,
+        close = function() random_closed = true end,
+    }
+end
+setfenv(Settings.get_device_fingerprint, setmetatable({ io = { open = open_random } }, {
+    __index = original_environment,
+}))
+local before_fingerprint_flush = flush_count
+local fingerprint = settings:get_device_fingerprint()
+expect(fingerprint == "4294901244" and random_closed,
+    "fingerprint must use unsigned decimal format and close the random source")
+expect(values.device_fingerprint == fingerprint and flush_count == before_fingerprint_flush + 1,
+    "fingerprint must be persisted before login begins")
+expect(Settings:new():get_device_fingerprint() == fingerprint and random_reads == 1,
+    "reopening settings should reuse the existing fingerprint")
+
 settings:reset_account()
 expect(values.api_key == "" and next(values.cookies) == nil
     and values.account.name == "",
     "account reset left credentials behind")
+expect(settings:get_device_fingerprint() == fingerprint and random_reads == 1,
+    "logout must not rotate the device fingerprint")
+
+values.device_fingerprint = ""
+random_bytes = string.char(1, 2, 3, 4)
+expect(settings:get_device_fingerprint() ~= fingerprint and random_reads == 2,
+    "a separate installation should generate its own fingerprint")
+values.device_fingerprint = "invalid; cookie=value"
+random_bytes = "short"
+local ok = pcall(function() settings:get_device_fingerprint() end)
+expect(not ok and values.device_fingerprint == "invalid; cookie=value",
+    "failed entropy reads must not save a partial or shared fallback fingerprint")
+setfenv(Settings.get_device_fingerprint, original_environment)
 
 print(("settings_spec: %d checks"):format(checks))

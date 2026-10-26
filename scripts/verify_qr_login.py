@@ -3,7 +3,7 @@
 
 The script mirrors the login flow used by the maintained fork:
 
-1. Establish a temporary session on /r/weread-skills.
+1. Generate a per-session wr_fp and visit /r/weread-skills.
 2. Request a QR login UID from /api/auth/getLoginUid.
 3. Wait for confirmation through /api/auth/getLoginInfo.
 4. Handle the optional four-digit OTP.
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import secrets
 import sys
 import tempfile
 import webbrowser
@@ -42,6 +43,22 @@ USER_AGENT = (
 
 class ProtocolError(RuntimeError):
     """Raised when WeRead returns an unexpected login response."""
+
+
+def create_session(*, use_fingerprint: bool = True) -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+        }
+    )
+    if use_fingerprint:
+        # The plugin persists this unsigned decimal value per installation.
+        session.cookies.set(
+            "wr_fp", str(secrets.randbits(32)), domain=".weread.qq.com", path="/"
+        )
+    return session
 
 
 def describe_shape(value: Any, depth: int = 0) -> Any:
@@ -124,10 +141,8 @@ def poll_login(
     uid: str,
     otp: str = "",
 ) -> dict[str, Any]:
-    # The empty form is intentionally `&otp`, not `&otp=`.
-    url = f"{LOGIN_INFO_URL}?uid={quote(uid, safe='')}&otp"
-    if otp:
-        url += f"={quote(otp, safe='')}"
+    # Match the plugin: keep an explicit empty value when no OTP is needed.
+    url = f"{LOGIN_INFO_URL}?uid={quote(uid, safe='')}&otp={quote(otp, safe='')}"
     return request_json(
         session,
         url,
@@ -159,7 +174,7 @@ def wait_for_login(session: requests.Session, uid: str) -> dict[str, Any]:
         if logic_code in {"LOGIN_TIMEOUT", "OTP_EXPIRED"}:
             raise ProtocolError(f"Login stopped with {logic_code}")
 
-        raise ProtocolError(f"Unexpected login state: {logic_code or result!r}")
+        raise ProtocolError(f"Unexpected login response shape: {describe_shape(result)!r}")
 
     return result
 
@@ -286,15 +301,15 @@ def main() -> int:
         action="store_true",
         help="Generate a local QR image and open it in the default browser.",
     )
+    parser.add_argument(
+        "--without-fingerprint",
+        action="store_true",
+        help="Use the original fingerprint-free flow as a comparison baseline.",
+    )
     args = parser.parse_args()
 
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json, text/plain, */*",
-        }
-    )
+    session = create_session(use_fingerprint=not args.without_fingerprint)
+    print(f"Device fingerprint enabled: {not args.without_fingerprint}", flush=True)
 
     print("Establishing a temporary WeRead login session...", flush=True)
     uid = establish_session(session)

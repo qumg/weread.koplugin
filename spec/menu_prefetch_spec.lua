@@ -4,6 +4,7 @@ package.path = "./?.lua;" .. package.path
 
 local registered = {}
 local shown_widget
+local closed_widget
 package.preload["dispatcher"] = function()
     return {
         registerAction = function(_self, name, action)
@@ -18,10 +19,21 @@ for _, name in ipairs({
     "ui/widget/buttondialog",
     "ui/widget/confirmbox",
     "ui/widget/infomessage",
+    "ui/widget/textviewer",
+    "ui/widget/qrmessage",
 }) do
     package.preload[name] = function()
-        return { new = function(_self, options) return options end }
+        return { new = function(_self, options)
+            options.onClose = function(widget) closed_widget = widget end
+            return options
+        end }
     end
+end
+package.preload["device"] = function()
+    return { screen = {
+        getWidth = function() return 600 end,
+        getHeight = function() return 800 end,
+    } }
 end
 package.preload["ui/uimanager"] = function()
     return {
@@ -45,6 +57,15 @@ package.preload["weread.lib.plugin_util"] = function()
     }
 end
 
+for _, module in ipairs({
+    "ui/elements/filemanager_menu_order",
+    "ui/elements/reader_menu_order",
+}) do
+    package.preload[module] = function()
+        return { tools = { "statistics", "more_tools" } }
+    end
+end
+
 local Menu = require("weread.ui.menu")
 
 local checks, failures = 0, 0
@@ -58,7 +79,6 @@ end
 
 local cache = {
     auto_prefetch_next_chapter = false,
-    book_footnotes_in_popup = false,
     download_underlines_and_thoughts = false,
     prefetch_annotations = false,
     show_prefetch_notifications = true,
@@ -76,6 +96,7 @@ local thought_popup = {
 local available_version
 local annotations_visible = false
 local annotation_menu_updates = 0
+local prefetch_cancellations = 0
 local host = {
     ui = {},
     _xpointerOverlayPrototypeAvailable = function() return true end,
@@ -94,6 +115,7 @@ local host = {
         flush = function() flush_count = flush_count + 1 end,
     },
     downloader = { cancelPrefetch = function() end },
+    cancelAnnotationPrefetch = function() prefetch_cancellations = prefetch_cancellations + 1 end,
     updater = { available_version = function() return available_version end },
     isAnnotationPrefetchEnabled = function()
         return cache.prefetch_annotations == true
@@ -113,8 +135,17 @@ host:onDispatcherRegisterActions()
 expect(registered.weread_show == nil,
     "generic WeRead shortcut action is no longer registered")
 local sync_action = registered.weread_sync_progress
-expect(sync_action == nil,
-    "standalone sync action is no longer registered")
+expect(sync_action and sync_action.event == "WeReadSyncProgress"
+        and sync_action.title == "WeRead · Sync progress now"
+        and sync_action.category == "none"
+        and sync_action.reader == true and sync_action.general ~= true,
+    "sync gesture reuses the quick-menu event as a reader-only action")
+local report_action = registered.weread_read_report_status
+expect(report_action and report_action.event == "ShowWeReadReportStatus"
+        and report_action.title == "WeRead · Reading time report status"
+        and report_action.category == "none"
+        and report_action.reader == true and report_action.general ~= true,
+    "reading report status is registered as a reader-only action")
 local quick_action = registered.weread_quick_menu
 expect(quick_action ~= nil, "quick menu dispatcher action is registered")
 expect(quick_action and quick_action.event == "ShowWeReadQuickMenu",
@@ -141,6 +172,16 @@ expect(upload_action and upload_action.reader == true
     "upload progress action is reader-only")
 expect(upload_action and upload_action.title == "WeRead: Upload progress",
     "upload progress action uses the requested title")
+local continue_action = registered.weread_continue_annotation_matching
+expect(continue_action
+        and continue_action.event == "WeReadContinueAnnotationMatching",
+    "continue-matching action dispatches the matching reader event")
+expect(continue_action and continue_action.reader == true
+        and continue_action.general ~= true,
+    "continue-matching action is reader-only")
+expect(continue_action
+        and continue_action.title == "WeRead · Continue matching underlines and thoughts",
+    "continue-matching action has a gesture-friendly title")
 expect(registered.weread_current_page_thoughts == nil,
     "current-page thoughts is no longer exposed as a separate shortcut action")
 local bookshelf_action = registered.weread_bookshelf
@@ -220,8 +261,8 @@ local last_settings_item = settings_items[#settings_items]
 expect(last_settings_item and last_settings_item.text == "About",
     "about is the last settings menu item")
 local about_items = last_settings_item and last_settings_item.sub_item_table_func()
-expect(about_items and #about_items == 5,
-    "about contains version, author, and three update settings")
+expect(about_items and #about_items == 6,
+    "about contains version, author, WeReader, and three update settings")
 for index, item in ipairs(about_items or {}) do
     expect(item.keep_menu_open == true,
         "about item " .. index .. " keeps the menu open")
@@ -230,19 +271,36 @@ expect(about_items[1] and about_items[1].text == "Version %1",
     "version is the first about item")
 expect(about_items[2] and about_items[2].text == "Author: %1",
     "author is the second about item")
-expect(about_items[3] and about_items[3].text == "Check for updates"
-        and about_items[4].text == "Automatically check once a day"
-        and about_items[5].text == "Prefer proxy for updates",
-    "update settings follow version and author at the same level")
+expect(about_items[3] and about_items[3].text == "Discover WeReader closed-source edition",
+    "WeReader entry follows the author")
+expect(about_items[4] and about_items[4].text == "Check for updates"
+        and about_items[5].text == "Automatically check once an hour"
+        and about_items[6].text == "Prefer proxy for updates",
+    "update settings follow the WeReader entry at the same level")
 available_version = "0.7.0"
 local update_available_items = last_settings_item.sub_item_table_func()
-expect(#update_available_items == 5
-        and update_available_items[3].text == "Update to v%1",
-    "available update replaces the check item without adding a sixth item")
+expect(#update_available_items == 6
+        and update_available_items[4].text == "Update to v%1",
+    "available update replaces the check item without adding another item")
 available_version = nil
 about_items[1].callback()
 expect(shown_widget and shown_widget.text:find("Disclaimer", 1, true),
     "version item preserves the previous about dialog behavior")
+about_items[3].callback()
+local recommendation = shown_widget
+expect(recommendation.title == "WeReader closed-source edition"
+        and recommendation.text:find("Xiaohongshu/Xianyu nickname", 1, true),
+    "recommendation includes both account names")
+expect(#recommendation.buttons_table == 2
+        and recommendation.buttons_table[1][1].text == "Xiaohongshu QR code",
+    "recommendation offers only Xiaohongshu QR and a return button")
+recommendation.buttons_table[1][1].callback()
+expect(shown_widget.text == "http://xhslink.com/m/8aP668RQREF"
+        and shown_widget.width == 540 and shown_widget.height == 540
+        and shown_widget.timeout == nil and closed_widget == nil,
+    "native QR uses the decoded profile URL without closing the introduction or timing out")
+recommendation.buttons_table[2][1].callback()
+expect(closed_widget == recommendation, "return closes the recommendation")
 local main_items = host:getMainMenuItems()
 expect(main_items[#main_items] and main_items[#main_items].text == "Settings",
     "about is no longer present in the outer menu")
@@ -320,18 +378,7 @@ for _, item in ipairs(download_items or {}) do
     if item.text == "Hide footnote text" then footnote_popup = item end
 end
 expect(prefetch ~= nil, "download settings contain a prefetch submenu")
-expect(footnote_popup and not footnote_popup.checked_func(),
-    "book footnotes default to in-page display")
-footnote_popup.callback({
-    updateItems = function() menu_update_count = menu_update_count + 1 end,
-})
-expect(cache.book_footnotes_in_popup == false
-        and shown_widget
-        and shown_widget.text:find("Settings → Links", 1, true),
-    "enabling hidden footnotes should first explain the KOReader popup setting")
-shown_widget.ok_callback()
-expect(cache.book_footnotes_in_popup == true and footnote_popup.checked_func(),
-    "book footnotes were hidden only after confirmation")
+expect(footnote_popup == nil, "footnote display is controlled by the reader")
 
 local prefetch_items = prefetch and prefetch.sub_item_table_func() or {}
 expect(#prefetch_items == 3, "chapter prefetch contains its two related preferences")
@@ -370,6 +417,11 @@ expect(cache.prefetch_annotations == true and menu_updates == 2,
     "annotation prefetch is enabled and refreshes the menu")
 expect(prefetch_items[3].enabled_func(),
     "notification setting is enabled while automatic prefetch is on")
+
+prefetch_items[1].callback({ updateItems = function() end })
+expect(not cache.auto_prefetch_next_chapter and cache.prefetch_annotations
+        and prefetch_cancellations == 1,
+    "disabling chapter prefetch cancels annotations while retaining the child preference")
 
 local underline_settings
 for _, item in ipairs(settings_items) do

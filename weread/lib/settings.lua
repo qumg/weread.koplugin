@@ -10,6 +10,7 @@ Settings.AUTH_SCHEMA_VERSION = 1
 
 local defaults = {
     auth_schema_version = Settings.AUTH_SCHEMA_VERSION,
+    device_fingerprint = "",
     api_key = "",
     cookies = {},
     wr_ticket = "",
@@ -81,6 +82,9 @@ local defaults = {
         auto_check = false,
         prefer_proxy = true,
         last_check = 0,
+        skipped_version = "",
+        snoozed_version = "",
+        snooze_until = 0,
         available_version = "",
         archive_url = "",
         checksum_url = "",
@@ -122,14 +126,35 @@ local function clear_auth_store(store)
 end
 
 function Settings:new()
-    local data_dir = DataStorage:getFullDataDir() .. "/weread"
+    local Environment = require("weread.lib.mock_environment")
+    local environment = Environment.active()
+    local mock_endpoint
+    if environment.enabled then
+        -- Invalid saved configuration must never silently select production.
+        mock_endpoint = assert(Environment.endpoint(environment))
+    end
+    local name = mock_endpoint and "weread-mock" or "weread"
+    local data_dir = DataStorage:getFullDataDir() .. "/" .. name
     ensure_dir(data_dir)
     local obj = {
         data_dir = data_dir,
         default_cache_dir = data_dir .. "/cache",
-        settings_file = DataStorage:getSettingsDir() .. "/weread.lua",
+        settings_file = DataStorage:getSettingsDir() .. "/" .. name .. ".lua",
+        mock_endpoint = mock_endpoint,
+        collection_name = name,
     }
     obj.store = LuaSettings:open(obj.settings_file)
+    if mock_endpoint then
+        obj.store:saveSetting("auth_schema_version", Settings.AUTH_SCHEMA_VERSION)
+        obj.store:saveSetting("api_key", "mock-api-key")
+        obj.store:saveSetting("cookies", { wr_skey = "mock-only", wr_vid = "900000" })
+        obj.store:saveSetting("account", { name = "Mock", user_vid = "900000", login_method = "mock" })
+        obj.store:saveSetting("wr_ticket", "")
+        obj.store:saveSetting("wr_wrpa", "")
+        -- A test must not move downloaded files into a production cache.
+        obj.store:saveSetting("download_dir", "")
+        obj.store:flush()
+    end
     -- cache_dir is the download root; defaults to <data_dir>/cache unless overridden.
     local download_dir = obj.store:readSetting("download_dir", "")
     obj.cache_dir = (type(download_dir) == "string" and download_dir ~= "") and download_dir or obj.default_cache_dir
@@ -265,6 +290,29 @@ function Settings:flush()
     self.store:flush()
 end
 
+function Settings:get_device_fingerprint()
+    local fingerprint = self:get("device_fingerprint", "")
+    if type(fingerprint) == "string" and #fingerprint <= 10
+        and fingerprint:match("^%d+$") and tonumber(fingerprint) <= 4294967295 then
+        return fingerprint
+    end
+
+    -- Match the website's unsigned 32-bit decimal wr_fp format. This identifies
+    -- an installation, not an account, and must survive logout and QR retries.
+    local source = io.open("/dev/urandom", "rb")
+    if not source then error("Could not generate WeRead device fingerprint") end
+    local bytes = source:read(4)
+    source:close()
+    if not bytes or #bytes ~= 4 then
+        error("Could not generate WeRead device fingerprint")
+    end
+    local a, b, c, d = bytes:byte(1, 4)
+    fingerprint = string.format("%.0f", ((a * 256 + b) * 256 + c) * 256 + d)
+    self:set("device_fingerprint", fingerprint)
+    self:flush()
+    return fingerprint
+end
+
 function Settings:update_auth(credentials, options)
     credentials = credentials or {}
     options = options or {}
@@ -324,6 +372,7 @@ end
 
 -- Pass nil or "" to reset to the default download directory.
 function Settings:set_download_dir(path)
+    if self.mock_endpoint then return self.cache_dir end
     if type(path) ~= "string" or path == "" then
         self:set("download_dir", "")
         self.cache_dir = self.default_cache_dir

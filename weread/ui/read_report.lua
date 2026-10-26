@@ -67,6 +67,16 @@ function M:getReadReportMenuItems()
         },
         {
             text_func = function()
+                local interval = tonumber(self.settings:get("read_report").interval_seconds) or 30
+                return T(_("Report interval: %1 s"), interval)
+            end,
+            keep_menu_open = true,
+            sub_item_table_func = function()
+                return self:getReportIntervalMenuItems()
+            end,
+        },
+        {
+            text_func = function()
                 local current = self.settings:get("read_report")
                 if current.mode == "manual" and current.book_title ~= "" then
                     return _("Select target book") .. " · " .. current.book_title
@@ -82,29 +92,71 @@ function M:getReadReportMenuItems()
             text = _("Report status"),
             keep_menu_open = true,
             callback = self:safeCallback(_("Report status"), function()
-                local cur = self.settings:get("read_report")
-                local report_status = self.read_report:status()
-                local target
-                if cur.mode == "auto" then
-                    local auto_title = report_status.target_book_title
-                    target = auto_title and T(_("Auto: %1"), auto_title) or _("Auto-associate")
-                else
-                    target = cur.book_title ~= "" and cur.book_title or _("Not configured")
-                end
-                local status = report_status.running and _("Running") or _("Stopped")
-                local count = report_status.count
-                local last = report_status.last_time
-                    and os.date("%H:%M:%S", report_status.last_time) or "--"
-                local err = report_status.last_error or ""
-                local msg = T(_("Report book: %1\nStatus: %2"), target, status)
-                    .. "\n" .. T(_("Reported: %1 times, last: %2"), tostring(count), last)
-                if err ~= "" then
-                    msg = msg .. "\n" .. T(_("Last error: %1"), err)
-                end
-                self:showInfo(msg)
+                self:onShowWeReadReportStatus()
             end),
         },
     }
+end
+
+-- Preset reporting intervals. A longer interval means fewer network wake-ups,
+-- which matters on battery-powered e-ink devices.
+function M:getReportIntervalMenuItems()
+    local items = {}
+    for _i, seconds in ipairs({ 30, 60 }) do
+        local label = T(_("%1 seconds"), seconds)
+        items[#items + 1] = {
+            text = label,
+            keep_menu_open = true,
+            check_callback_updates_menu = true,
+            checked_func = function()
+                local current = tonumber(self.settings:get("read_report").interval_seconds) or 30
+                return current == seconds
+            end,
+            callback = self:safeCallback(label, function(touchmenu_instance)
+                local cur = self.settings:get("read_report")
+                if (tonumber(cur.interval_seconds) or 30) == seconds then
+                    return
+                end
+                cur.interval_seconds = seconds
+                self.settings:set("read_report", cur)
+                self.settings:flush()
+                -- Hand the new interval to the running session instead of
+                -- restarting it: a report already in flight is allowed to
+                -- finish and write back its result.
+                if self.read_report then
+                    self.read_report:reschedule("interval_changed")
+                end
+                if touchmenu_instance then
+                    touchmenu_instance:updateItems()
+                end
+            end),
+        }
+    end
+    return items
+end
+
+function M:onShowWeReadReportStatus()
+    local cur = self.settings:get("read_report")
+    local report_status = self.read_report:status()
+    local target
+    if cur.mode == "auto" then
+        local auto_title = report_status.target_book_title
+        target = auto_title and T(_("Auto: %1"), auto_title) or _("Auto-associate")
+    else
+        target = cur.book_title ~= "" and cur.book_title or _("Not configured")
+    end
+    local status = report_status.running and _("Running") or _("Stopped")
+    local count = report_status.count
+    local last = report_status.last_time
+        and os.date("%H:%M:%S", report_status.last_time) or "--"
+    local err = report_status.last_error or ""
+    local msg = T(_("Report book: %1\nStatus: %2"), target, status)
+        .. "\n" .. T(_("Reported: %1 times, last: %2"), tostring(count), last)
+    if err ~= "" then
+        msg = msg .. "\n" .. T(_("Last error: %1"), err)
+    end
+    self:showInfo(msg)
+    return true
 end
 
 function M:getReportTargetMenuItems()
