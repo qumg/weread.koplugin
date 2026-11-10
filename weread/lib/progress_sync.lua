@@ -383,17 +383,70 @@ function ProgressSync:_apply_remote(remote, context, options)
     return true
 end
 
-function ProgressSync:_upload_snapshot(position, reason, show_result)
+local function notify_success(show_result)
+    return show_result == true
+end
+
+local function notify_failure(show_result)
+    return show_result == true or show_result == "failure_only"
+end
+
+function ProgressSync:_last_uploaded(book_id)
+    if type(self.last_uploaded_position) == "table"
+        and tostring(self.last_uploaded_position.book_id or book_id) == tostring(book_id) then
+        return self.last_uploaded_position
+    end
+    local books = self.settings:get("books", {})
+    local book = books[tostring(book_id)] or {}
+    if type(book.last_uploaded_position) == "table" then
+        return book.last_uploaded_position
+    end
+    return nil
+end
+
+function ProgressSync:_should_upload_position(position)
     if type(position) ~= "table" then return false end
+    if self.dirty then return true end
+    local last = self:_last_uploaded(position.book_id or self.current_book_id)
+    if type(last) ~= "table" then return true end
+    return not PositionMapper.same_position(position, last)
+end
+
+function ProgressSync:_mark_upload_deferred_failure(book_id, error_message)
+    self:_persist(book_id, {
+        pending_upload_notify = true,
+        last_sync_error = tostring(error_message or "upload_failed"),
+    })
+end
+
+function ProgressSync:_upload_snapshot(position, reason, show_result, on_done)
+    if type(position) ~= "table" then
+        if type(on_done) == "function" then on_done(false) end
+        return false
+    end
     local book_id = tostring(position.book_id or self.current_book_id or "")
-    if book_id == "" or self.uploading then return false end
+    if book_id == "" or self.uploading then
+        if type(on_done) == "function" then on_done(false) end
+        return false
+    end
+    local function finish(ok)
+        if type(on_done) == "function" then on_done(ok == true) end
+    end
     self:_persist(book_id, {
         pending_upload_position = position,
         pending_upload_reason = reason or "unspecified",
     })
     if not self.is_online() then
         self.state = "offline"
-        if show_result then self.notify("offline", {}) end
+        if notify_failure(show_result) then
+            self.notify("offline", {})
+        end
+        if show_result ~= true then
+            self:_mark_upload_deferred_failure(book_id, "offline")
+        else
+            self:_persist(book_id, { last_sync_error = "offline" })
+        end
+        finish(false)
         return false
     end
     self.uploading = true
@@ -429,15 +482,17 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
                 last_upload_at = self.now(),
                 pending_upload_position = false,
                 pending_upload_reason = false,
+                pending_upload_notify = false,
                 last_sync_error = false,
             })
             log("info", "upload accepted:",
                 "book=", book_id,
                 "percent=", tostring(position.percent),
                 "reason=", tostring(reason))
-            if show_result then
+            if notify_success(show_result) then
                 self.notify("upload_success", { position = position })
             end
+            finish(true)
             return
         end
         local error_message = ok and type(outcome) == "table"
@@ -447,18 +502,71 @@ function ProgressSync:_upload_snapshot(position, reason, show_result)
             last_sync_error = tostring(error_message or "upload_failed"),
         })
         log("warn", "upload failed:", tostring(error_message))
-        if show_result then
+        if notify_failure(show_result) then
             self.notify("upload_failed", {
                 error = tostring(error_message or "upload_failed"),
             })
         end
+        if show_result ~= true then
+            self:_mark_upload_deferred_failure(
+                book_id, error_message or "upload_failed")
+        else
+            self:_persist(book_id, {
+                last_sync_error = tostring(error_message or "upload_failed"),
+            })
+        end
+        finish(false)
     end
     local started = self.run_online("progress_upload", attempt)
     if not started then
         self.uploading = false
         self.state = "offline"
+        if notify_failure(show_result) then
+            self.notify("offline", {})
+        end
+        if show_result ~= true then
+            self:_mark_upload_deferred_failure(book_id, "offline")
+        else
+            self:_persist(book_id, { last_sync_error = "offline" })
+        end
+        finish(false)
     end
     return started == true
+end
+
+function ProgressSync:_flush_pending_upload(book_id, options)
+    options = options or {}
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        if type(options.on_done) == "function" then options.on_done(false) end
+        return false
+    end
+    local books = self.settings:get("books", {})
+    local book = books[book_id] or books[tonumber(book_id)] or {}
+    local pending = book.pending_upload_position
+    local want_notify = book.pending_upload_notify == true
+    if type(pending) ~= "table" then
+        if want_notify then
+            self.notify("upload_failed", {
+                error = tostring(book.last_sync_error or "upload_failed"),
+            })
+            self:_persist(book_id, { pending_upload_notify = false })
+        end
+        if type(options.on_done) == "function" then options.on_done(false) end
+        return false
+    end
+    pending.book_id = pending.book_id or book_id
+    -- Prefer failure-only toast for deferred retries; avoid success spam.
+    local show_result = want_notify and "failure_only" or false
+    if want_notify then
+        self:_persist(book_id, { pending_upload_notify = false })
+    end
+    return self:_upload_snapshot(
+        pending,
+        book.pending_upload_reason or "pending_retry",
+        show_result,
+        options.on_done
+    )
 end
 
 function ProgressSync:_keep_local(local_position, remote, options)
@@ -730,6 +838,31 @@ function ProgressSync:cancel_pending_jump(reason)
     return true
 end
 
+function ProgressSync:_after_open_setup(book_id, generation)
+    local function maybe_pull()
+        if generation ~= self.generation then return end
+        if self:_config().pull_on_open ~= true then
+            if not self.verified then self.state = "unverified" end
+            return
+        end
+        self:_pull({ manual = false })
+    end
+
+    local books = self.settings:get("books", {})
+    local book = books[book_id] or {}
+    local has_pending = type(book.pending_upload_position) == "table"
+        or book.pending_upload_notify == true
+    if not has_pending then
+        maybe_pull()
+        return
+    end
+    self:_flush_pending_upload(book_id, {
+        on_done = function()
+            maybe_pull()
+        end,
+    })
+end
+
 function ProgressSync:on_reader_ready()
     self.generation = self.generation + 1
     local generation = self.generation
@@ -760,11 +893,7 @@ function ProgressSync:on_reader_ready()
         end
         self.local_position = local_position
         self:_persist(book_id, { last_local_position = local_position })
-        if self:_config().pull_on_open ~= true then
-            self.state = "unverified"
-            return
-        end
-        self:_pull({ manual = false })
+        self:_after_open_setup(book_id, generation)
     end)
 end
 
@@ -781,13 +910,12 @@ end
 
 function ProgressSync:on_close_document()
     local position = self:capture_local() or self.local_position
-    if position and self.verified
-        and self:_config().upload_on_close == true then
+    if position and self:_config().upload_on_close == true then
         if not self.local_position
             or not PositionMapper.same_position(position, self.local_position) then
             self.dirty = true
         end
-        if self.dirty then
+        if self:_should_upload_position(position) then
             self:_upload_snapshot(position, "document_close", false)
         end
     end
@@ -806,8 +934,8 @@ function ProgressSync:on_suspend()
         and not PositionMapper.same_position(position, self.local_position) then
         self.dirty = true
     end
-    if position and self.verified and self.dirty
-        and self:_config().upload_on_close == true then
+    if position and self:_config().upload_on_close == true
+        and self:_should_upload_position(position) then
         self:_upload_snapshot(position, "suspend", false)
     end
 end
@@ -815,6 +943,29 @@ end
 function ProgressSync:on_resume()
     local slept = self.suspended_at and self.now() - self.suspended_at or 0
     self.suspended_at = nil
+    local book_id = self.detect_book()
+    if book_id and not is_mp_book(book_id) then
+        book_id = tostring(book_id)
+        self.current_book_id = self.current_book_id or book_id
+        local generation = self.generation
+        local function maybe_pull()
+            if generation ~= self.generation then return end
+            if slept >= RESUME_RECHECK_SECONDS
+                and self:_config().pull_on_open == true then
+                self:_clear_verified("resume_recheck")
+                self:_pull({ manual = false })
+            end
+        end
+        local books = self.settings:get("books", {})
+        local book = books[book_id] or {}
+        if type(book.pending_upload_position) == "table"
+            or book.pending_upload_notify == true then
+            self:_flush_pending_upload(book_id, { on_done = maybe_pull })
+            return
+        end
+        maybe_pull()
+        return
+    end
     if slept >= RESUME_RECHECK_SECONDS
         and self:_config().pull_on_open == true then
         self:_clear_verified("resume_recheck")

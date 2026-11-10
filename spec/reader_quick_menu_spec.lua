@@ -119,6 +119,17 @@ dialog_callbacks.on_toggle_annotations()
 expect(annotations_toggled,
     "quick menu annotation button delegates to the shared visibility toggle")
 
+local closed, bookshelf_after_close, file_manager_path = false, false, nil
+context_host.ui = {
+    document = { file = "/books/local.epub" },
+    onClose = function() closed = true end,
+    showFileManager = function(_self, file) file_manager_path = file end,
+}
+context_host.showBookshelf = function() bookshelf_after_close = true end
+dialog_callbacks.on_close_book()
+expect(closed and bookshelf_after_close and file_manager_path == nil,
+    "closing a book returns to the WeRead bookshelf")
+
 context_books["mp-book"] = { book_id = "mp-book", title = "Article" }
 context_host.ensureChaptersLoaded = function()
     error("public account quick menu must not load regular book chapters")

@@ -126,14 +126,15 @@ function M:showEndOfBookDialog(book_id)
             self:toggleAnnotationVisibility()
         end,
         on_close_book = function()
-            -- Mirror KOReader's ReaderStatus:openFileBrowser(): closing the
-            -- reader alone exits the app when there is no file-manager stack, so
-            -- reopen the file browser right after (positioned on the book file).
+            -- Prefer the WeRead bookshelf after closing. Fall back to the file
+            -- browser only when the bookshelf entry point is unavailable.
             local ui = self.ui
             if not ui then return end
             local file = ui.document and ui.document.file
             ui:onClose()
-            if file and ui.showFileManager then
+            if self.showBookshelf then
+                self:showBookshelf()
+            elseif file and ui.showFileManager then
                 ui:showFileManager(file)
             end
         end,

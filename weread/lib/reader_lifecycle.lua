@@ -169,7 +169,13 @@ function M:onReaderReady()
     local annotations_ready = perf("annotations_ready", opened)
     self.progress_sync:on_reader_ready()
     local prefetch_session_gen = self._reader_session_gen
-    UIManager:scheduleIn(0.2, function()
+    -- When both next-chapter and annotation prefetch are on, delay chapter
+    -- prefetch so open-book cached matching can start first.
+    local cache = self.settings:get("cache") or {}
+    local dual_prefetch = cache.auto_prefetch_next_chapter == true
+        and cache.prefetch_annotations == true
+    local prefetch_delay = dual_prefetch and 1.8 or 0.2
+    UIManager:scheduleIn(prefetch_delay, function()
         if prefetch_session_gen ~= self._reader_session_gen then return end
         self:maybePrefetchNextChapter(weread_book_id)
     end)

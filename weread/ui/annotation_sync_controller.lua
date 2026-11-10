@@ -691,8 +691,19 @@ function M:onUnifiedAnnotationsReady()
         end
         perf("annotation_cached_match_selection", started, "cached_chapters=", #cached,
             "mapped_chapters=", #context.chapters)
-        if #cached > 0 then self:_runAnnotationJob(context, {
-            background = true, offline = not self:isNetworkConnected(), chapters = cached }) end
+        if #cached > 0 then
+            -- Let the first page paint before matching cached chapters.
+            local session_gen = self._reader_session_gen
+            UIManager:scheduleIn(0.7, function()
+                if session_gen ~= self._reader_session_gen then return end
+                if not self._unified_annotations_active then return end
+                self:_runAnnotationJob(context, {
+                    background = true,
+                    offline = not self:isNetworkConnected(),
+                    chapters = cached,
+                })
+            end)
+        end
     else
         perf("annotation_open_match_disabled", started)
     end

@@ -611,6 +611,110 @@ test("manual upload stays silent about cloud progress when offline", function()
     eq(f.notifications[1].code, "offline", "offline message is explicit")
 end)
 
+test("close uploads without a prior pull when upload_on_close is on", function()
+    local f = fixture({
+        bookId = "book",
+        progress = 80,
+        chapterUid = 33,
+        chapterIdx = 3,
+        chapterOffset = 500,
+        updateTime = 10,
+    })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(f.sync:status().verified, false, "open without pull stays unverified")
+    f.document.page = 40
+    f.sync:on_page_update()
+    f.sync:on_close_document()
+    eq(#f.uploads, 1, "close uploads without verified gate")
+    eq(f.uploads[1].percent, 40, "close uses the moved page")
+end)
+
+test("offline close keeps pending and retries on next open", function()
+    local online = false
+    local f = fixture({
+        bookId = "book",
+        progress = 80,
+        chapterUid = 33,
+        chapterIdx = 3,
+        chapterOffset = 500,
+        updateTime = 10,
+    }, {
+        is_online = function() return online end,
+    })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 55
+    f.sync:on_page_update()
+    f.sync:on_close_document()
+    eq(#f.uploads, 0, "offline close does not upload yet")
+    eq(type(f.values.books.book.pending_upload_position), "table",
+        "offline close stores pending snapshot")
+    eq(f.values.books.book.pending_upload_notify, true,
+        "offline close marks a deferred failure notice")
+
+    online = true
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.uploads, 1, "open retries the pending upload")
+    eq(f.uploads[1].percent, 55, "retry uses the pending page")
+    eq(f.values.books.book.pending_upload_position, nil,
+        "successful retry clears pending")
+    eq(#f.notifications, 0, "successful deferred retry stays quiet")
+end)
+
+test("failed pending retry notifies once on open", function()
+    local f = fixture({
+        bookId = "book",
+        progress = 25,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 150,
+        updateTime = 10,
+    })
+    f.values.sync.pull_on_open = false
+    f.values.books.book.pending_upload_position = {
+        book_id = "book",
+        percent = 40,
+        chapter_uid = 22,
+        chapter_idx = 2,
+        chapter_offset = 200,
+    }
+    f.values.books.book.pending_upload_reason = "document_close"
+    f.values.books.book.pending_upload_notify = true
+    f.sync.upload_position = function()
+        return false, { error = "server busy" }
+    end
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.notifications, 1, "failed retry notifies once")
+    eq(f.notifications[1].code, "upload_failed", "failure code is reported")
+    eq(type(f.values.books.book.pending_upload_position), "table",
+        "failed retry keeps pending for another attempt")
+    eq(f.values.books.book.pending_upload_notify, true,
+        "failed retry keeps a deferred notice for the next open")
+end)
+
+test("suspend uploads without verified when progress moved", function()
+    local f = fixture({
+        bookId = "book",
+        progress = 80,
+        chapterUid = 33,
+        chapterIdx = 3,
+        chapterOffset = 500,
+        updateTime = 10,
+    })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 42
+    f.sync:on_suspend()
+    eq(#f.uploads, 1, "suspend uploads without verified gate")
+    eq(f.uploads[1].percent, 42, "suspend uses current page")
+end)
+
 print(string.format(
     "progress_sync_spec: %d checks, %d failure(s)", checks, failures))
 os.exit(failures == 0 and 0 or 1)
