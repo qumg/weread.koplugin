@@ -534,6 +534,17 @@ function ProgressSync:_upload_snapshot(position, reason, show_result, on_done)
     return started == true
 end
 
+function ProgressSync:_clear_pending_upload(book_id, reason)
+    self:_persist(book_id, {
+        pending_upload_position = false,
+        pending_upload_reason = false,
+        pending_upload_notify = false,
+    })
+    log("info", "pending upload cleared:",
+        "book=", tostring(book_id),
+        "reason=", tostring(reason or "unspecified"))
+end
+
 function ProgressSync:_flush_pending_upload(book_id, options)
     options = options or {}
     book_id = tostring(book_id or "")
@@ -565,8 +576,262 @@ function ProgressSync:_flush_pending_upload(book_id, options)
         pending,
         book.pending_upload_reason or "pending_retry",
         show_result,
-        options.on_done
+        function(ok)
+            if type(options.on_done) == "function" then
+                options.on_done(ok and "uploaded" or false)
+            end
+        end
     )
+end
+
+-- Decide whether a local/pending snapshot should overwrite cloud progress.
+-- Returns: "same" | "remote_ahead" | "local_ahead" | "ambiguous"
+function ProgressSync:_upload_decision(local_position, remote)
+    local comparison = PositionMapper.compare(
+        local_position, remote, SAME_THRESHOLD_OFFSET)
+    if comparison == "same"
+        or comparison == "remote_ahead"
+        or comparison == "local_ahead" then
+        return comparison
+    end
+    -- Different chapters / unknown: prefer book percent, then timestamps.
+    local local_percent = tonumber(local_position and local_position.percent) or 0
+    local remote_percent = tonumber(remote and remote.percent) or 0
+    local percent_gap = remote_percent - local_percent
+    if percent_gap > SOURCE_CONFLICT_THRESHOLD_PERCENT then
+        return "remote_ahead"
+    end
+    if percent_gap < -SOURCE_CONFLICT_THRESHOLD_PERCENT then
+        return "local_ahead"
+    end
+    local local_ts = tonumber(local_position and local_position.captured_at) or 0
+    local remote_ts = tonumber(remote and remote.updated_at) or 0
+    if remote_ts > local_ts then return "remote_ahead" end
+    if local_ts > remote_ts then return "local_ahead" end
+    return "ambiguous"
+end
+
+-- Pull cloud first, then upload only when local/pending is ahead.
+-- options: generation, show_result, allow_ask, clear_pending_on_skip,
+--          defer_pending_on_block, on_done(result)
+function ProgressSync:_safe_upload_position(position, reason, options)
+    options = options or {}
+    local generation = options.generation or self.generation
+    local function done(result)
+        if type(options.on_done) == "function" then options.on_done(result) end
+    end
+    if type(position) ~= "table" then
+        done(false)
+        return false
+    end
+    local book_id = tostring(position.book_id or self.current_book_id or "")
+    if book_id == "" then
+        done(false)
+        return false
+    end
+    position.book_id = book_id
+
+    local function defer_via_snapshot(why)
+        if not options.defer_pending_on_block then
+            done(false)
+            return false
+        end
+        log("info", "upload deferred as pending:",
+            "book=", book_id, "why=", tostring(why))
+        self:_upload_snapshot(position, reason, false, function(ok)
+            done(ok and "uploaded" or "deferred")
+        end)
+        return true
+    end
+
+    if not self.settings:is_api_configured()
+        and not self.settings:is_cookie_configured() then
+        return defer_via_snapshot("not_configured")
+    end
+    if not self.is_online() then
+        if options.show_result == true or options.show_result == "failure_only" then
+            self.notify("offline", {})
+        end
+        return defer_via_snapshot("offline")
+    end
+
+    local _local, _reason, context = self:capture_local()
+    if not context or type(context.chapters) ~= "table" then
+        return defer_via_snapshot("no_context")
+    end
+
+    local started = self.run_online("progress_safe_upload", function()
+        if generation ~= self.generation then
+            -- Close bumps generation; still allow leave-upload to finish.
+            if not options.ignore_generation then return end
+        end
+        local remote, pull_error = self:_fetch_remote(book_id, context.chapters)
+        if not options.ignore_generation and generation ~= self.generation then
+            return
+        end
+        if not remote then
+            log("warn", "safe upload fetch failed:", tostring(pull_error))
+            defer_via_snapshot("fetch_failed")
+            return
+        end
+
+        local decision = self:_upload_decision(position, remote)
+        log("info", "safe upload decision:",
+            "book=", book_id,
+            "reason=", tostring(reason),
+            "decision=", tostring(decision))
+
+        if decision == "same" then
+            if options.clear_pending_on_skip then
+                self:_clear_pending_upload(book_id, "matches_remote")
+            end
+            self.dirty = false
+            done("same")
+            return
+        end
+        if decision == "remote_ahead" then
+            if options.clear_pending_on_skip then
+                self:_clear_pending_upload(book_id, "remote_ahead")
+            end
+            self.dirty = false
+            done("discarded")
+            return
+        end
+        if decision == "local_ahead" then
+            self:_upload_snapshot(
+                position,
+                reason,
+                options.show_result or false,
+                function(ok)
+                    done(ok and "uploaded" or false)
+                end
+            )
+            return
+        end
+
+        -- ambiguous
+        local ask = options.allow_ask ~= false
+            and self:_config().ask_on_conflict ~= false
+        if ask then
+            self.state = "awaiting_choice"
+            local choice_generation = self.generation
+            local function choice_is_current()
+                return choice_generation == self.generation
+                    and tostring(self.detect_book() or "") == book_id
+            end
+            self.on_choice({
+                book_title = context.book.title or book_id,
+                local_position = copy(position),
+                remote_position = copy(remote),
+                source_conflict = remote.conflict == true,
+                use_remote = function()
+                    if not choice_is_current() then return end
+                    if options.clear_pending_on_skip then
+                        self:_clear_pending_upload(book_id, "user_chose_remote")
+                    end
+                    local ok, apply_reason = self:_apply_remote(
+                        remote, context, { manual = false })
+                    if not ok then
+                        self.state = "error"
+                        self.notify("jump_failed", { error = apply_reason })
+                    end
+                end,
+                keep_local = function()
+                    if not choice_is_current() then return end
+                    self:_keep_local(position, remote, {
+                        upload_now = true,
+                        reason = reason or "local_choice",
+                    })
+                end,
+            })
+            done("awaiting_choice")
+            return
+        end
+
+        if options.defer_pending_on_block then
+            defer_via_snapshot("ambiguous")
+            return
+        end
+        if options.clear_pending_on_skip then
+            self:_clear_pending_upload(book_id, "ambiguous_keep_remote")
+        end
+        done("discarded")
+    end, { silent_offline = true })
+
+    if not started then
+        return defer_via_snapshot("online_task_blocked")
+    end
+    return true
+end
+
+-- Pending path: reuse safe upload against the stored snapshot.
+function ProgressSync:_reconcile_pending_upload(book_id, options)
+    options = options or {}
+    book_id = tostring(book_id or "")
+    local function done(result)
+        if type(options.on_done) == "function" then options.on_done(result) end
+    end
+    if book_id == "" then
+        done(false)
+        return false
+    end
+    local books = self.settings:get("books", {})
+    local book = books[book_id] or books[tonumber(book_id)] or {}
+    local pending = book.pending_upload_position
+    local want_notify = book.pending_upload_notify == true
+    if type(pending) ~= "table" then
+        if want_notify then
+            self.notify("upload_failed", {
+                error = tostring(book.last_sync_error or "upload_failed"),
+            })
+            self:_persist(book_id, { pending_upload_notify = false })
+        end
+        done(false)
+        return false
+    end
+    pending.book_id = pending.book_id or book_id
+    return self:_safe_upload_position(
+        pending,
+        book.pending_upload_reason or "pending_retry",
+        {
+            generation = options.generation or self.generation,
+            show_result = want_notify and "failure_only" or false,
+            allow_ask = true,
+            clear_pending_on_skip = true,
+            defer_pending_on_block = false,
+            on_done = done,
+        }
+    )
+end
+
+-- Reading-time helper for quick-menu bookshelf (document stays open).
+function ProgressSync:safe_upload_current(reason, options)
+    options = options or {}
+    if self:_config().upload_on_close ~= true
+        and options.require_upload_on_close ~= false then
+        if type(options.on_done) == "function" then options.on_done(false) end
+        return false
+    end
+    local position, err = self:capture_local()
+    if not position then
+        if type(options.on_done) == "function" then options.on_done(false) end
+        if options.show_result then
+            self.notify("local_unavailable", { error = err })
+        end
+        return false
+    end
+    if not self:_should_upload_position(position) and not options.force then
+        if type(options.on_done) == "function" then options.on_done("same") end
+        return false
+    end
+    return self:_safe_upload_position(position, reason or "manual_safe", {
+        generation = self.generation,
+        show_result = options.show_result or false,
+        allow_ask = options.allow_ask ~= false,
+        clear_pending_on_skip = true,
+        defer_pending_on_block = false,
+        on_done = options.on_done,
+    })
 end
 
 function ProgressSync:_keep_local(local_position, remote, options)
@@ -856,8 +1121,11 @@ function ProgressSync:_after_open_setup(book_id, generation)
         maybe_pull()
         return
     end
-    self:_flush_pending_upload(book_id, {
-        on_done = function()
+    self:_reconcile_pending_upload(book_id, {
+        generation = generation,
+        on_done = function(result)
+            if generation ~= self.generation then return end
+            if result == "awaiting_choice" then return end
             maybe_pull()
         end,
     })
@@ -910,13 +1178,22 @@ end
 
 function ProgressSync:on_close_document()
     local position = self:capture_local() or self.local_position
+    local leave_generation = self.generation
     if position and self:_config().upload_on_close == true then
         if not self.local_position
             or not PositionMapper.same_position(position, self.local_position) then
             self.dirty = true
         end
         if self:_should_upload_position(position) then
-            self:_upload_snapshot(position, "document_close", false)
+            -- Document is about to go away: pull-then-upload without prompts.
+            self:_safe_upload_position(position, "document_close", {
+                generation = leave_generation,
+                ignore_generation = true,
+                show_result = false,
+                allow_ask = false,
+                clear_pending_on_skip = true,
+                defer_pending_on_block = true,
+            })
         end
     end
     self.generation = self.generation + 1
@@ -936,7 +1213,13 @@ function ProgressSync:on_suspend()
     end
     if position and self:_config().upload_on_close == true
         and self:_should_upload_position(position) then
-        self:_upload_snapshot(position, "suspend", false)
+        self:_safe_upload_position(position, "suspend", {
+            generation = self.generation,
+            show_result = false,
+            allow_ask = false,
+            clear_pending_on_skip = true,
+            defer_pending_on_block = true,
+        })
     end
 end
 
@@ -960,7 +1243,14 @@ function ProgressSync:on_resume()
         local book = books[book_id] or {}
         if type(book.pending_upload_position) == "table"
             or book.pending_upload_notify == true then
-            self:_flush_pending_upload(book_id, { on_done = maybe_pull })
+            self:_reconcile_pending_upload(book_id, {
+                generation = generation,
+                on_done = function(result)
+                    if generation ~= self.generation then return end
+                    if result == "awaiting_choice" then return end
+                    maybe_pull()
+                end,
+            })
             return
         end
         maybe_pull()

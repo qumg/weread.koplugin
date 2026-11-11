@@ -130,6 +130,22 @@ dialog_callbacks.on_close_book()
 expect(closed and bookshelf_after_close and file_manager_path == nil,
     "closing a book returns to the WeRead bookshelf")
 
+local shelf_opened, safe_upload_called, book_still_open = false, false, true
+context_host.ui = {
+    document = { file = "/books/local.epub" },
+    onClose = function() book_still_open = false end,
+}
+context_host.progress_sync = {
+    safe_upload_current = function()
+        safe_upload_called = true
+        return true
+    end,
+}
+context_host.showBookshelf = function() shelf_opened = true end
+expect(context_host:showEndOfBookDialog(nil), "rebuild quick menu for bookshelf")
+dialog_callbacks.on_bookshelf()
+expect(safe_upload_called and shelf_opened and book_still_open,
+    "bookshelf syncs safely without closing the open book")
 context_books["mp-book"] = { book_id = "mp-book", title = "Article" }
 context_host.ensureChaptersLoaded = function()
     error("public account quick menu must not load regular book chapters")

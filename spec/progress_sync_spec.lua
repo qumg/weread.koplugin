@@ -209,6 +209,7 @@ test("unresolved conflict blocks reports and local choice uploads", function()
 end)
 
 test("page change uploads once on close", function()
+    -- Cloud sits behind the moved local page so close may upload.
     local f = fixture({
         bookId = "book",
         progress = 25,
@@ -223,6 +224,7 @@ test("page change uploads once on close", function()
     f.sync:on_page_update()
     eq(f.sync:status().dirty, true, "page change marks dirty")
     f.sync:on_close_document()
+    f.drain()
     eq(#f.uploads, 1, "close uploads once")
     eq(f.uploads[1].percent, 50, "close uploads current percent")
     eq(f.uploads[1].chapter_uid, 33, "close uploads current chapter")
@@ -294,6 +296,7 @@ test("suspend captures movement even without a page event", function()
     f.drain()
     f.document.page = 40
     f.sync:on_suspend()
+    f.drain()
     eq(#f.uploads, 1, "suspend uploads captured movement")
     eq(f.uploads[1].percent, 40, "suspend uses current page")
 end)
@@ -614,10 +617,10 @@ end)
 test("close uploads without a prior pull when upload_on_close is on", function()
     local f = fixture({
         bookId = "book",
-        progress = 80,
-        chapterUid = 33,
-        chapterIdx = 3,
-        chapterOffset = 500,
+        progress = 20,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 100,
         updateTime = 10,
     })
     f.values.sync.pull_on_open = false
@@ -627,18 +630,41 @@ test("close uploads without a prior pull when upload_on_close is on", function()
     f.document.page = 40
     f.sync:on_page_update()
     f.sync:on_close_document()
+    f.drain()
     eq(#f.uploads, 1, "close uploads without verified gate")
     eq(f.uploads[1].percent, 40, "close uses the moved page")
 end)
 
-test("offline close keeps pending and retries on next open", function()
-    local online = false
+test("close does not upload when cloud is ahead", function()
     local f = fixture({
         bookId = "book",
         progress = 80,
         chapterUid = 33,
         chapterIdx = 3,
         chapterOffset = 500,
+        updateTime = 90,
+    })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 30
+    f.sync:on_page_update()
+    f.sync:on_close_document()
+    f.drain()
+    eq(#f.uploads, 0, "close skips upload when remote is ahead")
+    eq(f.values.books.book.pending_upload_position, nil,
+        "close does not leave a stale pending over a newer cloud position")
+end)
+
+test("offline close keeps pending and retries on next open", function()
+    local online = false
+    -- Cloud still sits behind the offline pending snapshot.
+    local f = fixture({
+        bookId = "book",
+        progress = 25,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 150,
         updateTime = 10,
     }, {
         is_online = function() return online end,
@@ -658,11 +684,39 @@ test("offline close keeps pending and retries on next open", function()
     online = true
     f.sync:on_reader_ready()
     f.drain()
-    eq(#f.uploads, 1, "open retries the pending upload")
+    eq(#f.uploads, 1, "open retries the pending upload after pull check")
     eq(f.uploads[1].percent, 55, "retry uses the pending page")
     eq(f.values.books.book.pending_upload_position, nil,
         "successful retry clears pending")
     eq(#f.notifications, 0, "successful deferred retry stays quiet")
+end)
+
+test("open discards stale pending when cloud is ahead", function()
+    local f = fixture({
+        bookId = "book",
+        progress = 50,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 300,
+        updateTime = 50,
+    })
+    f.values.sync.pull_on_open = false
+    f.values.books.book.pending_upload_position = {
+        book_id = "book",
+        percent = 30,
+        chapter_uid = 22,
+        chapter_idx = 2,
+        chapter_offset = 100,
+        captured_at = 40,
+    }
+    f.values.books.book.pending_upload_reason = "suspend"
+    f.values.books.book.pending_upload_notify = true
+    f.sync:on_reader_ready()
+    f.drain()
+    eq(#f.uploads, 0, "stale pending is not uploaded over a newer cloud position")
+    eq(f.values.books.book.pending_upload_position, nil,
+        "stale pending is cleared")
+    eq(#f.choices, 0, "remote-ahead pending does not open a conflict dialog")
 end)
 
 test("failed pending retry notifies once on open", function()
@@ -681,6 +735,7 @@ test("failed pending retry notifies once on open", function()
         chapter_uid = 22,
         chapter_idx = 2,
         chapter_offset = 200,
+        captured_at = 100,
     }
     f.values.books.book.pending_upload_reason = "document_close"
     f.values.books.book.pending_upload_notify = true
@@ -700,10 +755,10 @@ end)
 test("suspend uploads without verified when progress moved", function()
     local f = fixture({
         bookId = "book",
-        progress = 80,
-        chapterUid = 33,
-        chapterIdx = 3,
-        chapterOffset = 500,
+        progress = 20,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 100,
         updateTime = 10,
     })
     f.values.sync.pull_on_open = false
@@ -711,8 +766,29 @@ test("suspend uploads without verified when progress moved", function()
     f.drain()
     f.document.page = 42
     f.sync:on_suspend()
+    f.drain()
     eq(#f.uploads, 1, "suspend uploads without verified gate")
     eq(f.uploads[1].percent, 42, "suspend uses current page")
+end)
+
+test("bookshelf safe upload skips when cloud is ahead", function()
+    local f = fixture({
+        bookId = "book",
+        progress = 60,
+        chapterUid = 22,
+        chapterIdx = 2,
+        chapterOffset = 400,
+        updateTime = 80,
+    })
+    f.values.sync.pull_on_open = false
+    f.sync:on_reader_ready()
+    f.drain()
+    f.document.page = 30
+    f.sync:on_page_update()
+    eq(f.sync:safe_upload_current("bookshelf", { allow_ask = true }), true,
+        "bookshelf sync starts a safe upload check")
+    f.drain()
+    eq(#f.uploads, 0, "bookshelf sync does not overwrite a newer cloud position")
 end)
 
 print(string.format(

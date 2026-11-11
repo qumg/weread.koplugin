@@ -77,6 +77,15 @@ function M:showEndOfBookDialog(book_id)
         annotations_visible = annotations_visible,
     }, {
         on_bookshelf = function()
+            -- Keep the document open so closing the shelf returns to reading.
+            -- When upload-on-close is enabled, sync safely (pull then maybe upload).
+            if self.progress_sync
+                and type(self.progress_sync.safe_upload_current) == "function" then
+                self.progress_sync:safe_upload_current("bookshelf", {
+                    allow_ask = true,
+                    show_result = false,
+                })
+            end
             self:showBookshelf()
         end,
         on_search = function()
