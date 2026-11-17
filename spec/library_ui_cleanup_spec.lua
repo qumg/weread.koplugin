@@ -112,4 +112,23 @@ host:openFile(nil)
 expect(#closed == 0 and host.shelf_view == shelf_view,
     "invalid open request unexpectedly closed the bookshelf")
 
+-- Host without openFile must fall back to ReaderUI:showReader instead of crashing.
+local shown
+package.preload["apps/reader/readerui"] = function()
+    return {
+        showReader = function(_self, path) shown = path end,
+    }
+end
+local fallback_host = {
+    ui = {},
+    showInfo = function() end,
+    closeWeReadUI = function() end,
+}
+for key, value in pairs(Library) do
+    if fallback_host[key] == nil then fallback_host[key] = value end
+end
+expect(fallback_host:openFile("/cache/fallback.epub") == true
+        and shown == "/cache/fallback.epub",
+    "missing ui.openFile did not fall back to ReaderUI:showReader")
+
 print(("library_ui_cleanup_spec: %d checks"):format(checks))

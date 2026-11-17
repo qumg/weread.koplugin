@@ -330,6 +330,7 @@ local zh = {
     ["Not cached"] = "未缓存",
     ["No actions."] = "没有可用操作。",
     ["No cached file."] = "没有已缓存文件。",
+    ["Unable to open the document."] = "无法打开文档。",
     ["Download failed:\n%1"] = "下载失败：\n%1",
     ["Another download is already in progress."] = "已有下载任务正在进行。",
     ["Checking network..."] = "正在检查网络……",

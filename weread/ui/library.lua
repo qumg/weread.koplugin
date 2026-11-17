@@ -1446,14 +1446,29 @@ end
 function M:openFile(path)
     if not path or path == "" then
         self:showInfo(_("No cached file."))
-        return
+        return false
     end
     self:closeWeReadUI()
-    if self.ui.document then
-        self.ui:switchDocument(path)
-    else
-        self.ui:openFile(path)
+    local ui = self.ui
+    -- Reader with an open document: switch in place.
+    if ui and ui.document and type(ui.switchDocument) == "function" then
+        ui:switchDocument(path)
+        return true
     end
+    -- FileManager (or hosts that expose the same helper).
+    if ui and type(ui.openFile) == "function" then
+        ui:openFile(path)
+        return true
+    end
+    -- Some hosts have neither document nor openFile (e.g. odd Reader/FM
+    -- states). Open through ReaderUI directly instead of crashing.
+    local ok, ReaderUI = pcall(require, "apps/reader/readerui")
+    if ok and ReaderUI and type(ReaderUI.showReader) == "function" then
+        ReaderUI:showReader(path)
+        return true
+    end
+    self:showInfo(_("Unable to open the document."))
+    return false
 end
 
 function M:openCachedBook(book)
